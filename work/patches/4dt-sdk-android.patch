@@ -374,7 +374,7 @@ index 3da182d..a2d7e9c 100644
    uint32_t rb_depth_clear;
    uint32_t rb_color_clear;
 diff --git a/include/rex/graphics/vulkan/command_processor.h b/include/rex/graphics/vulkan/command_processor.h
-index 696ff48..ead4a6c 100644
+index 696ff48..63e1c15 100644
 --- a/include/rex/graphics/vulkan/command_processor.h
 +++ b/include/rex/graphics/vulkan/command_processor.h
 @@ -47,6 +47,16 @@ namespace rex::graphics::vulkan {
@@ -480,7 +480,7 @@ index 696ff48..ead4a6c 100644
  
    std::vector<VkSparseMemoryBind> sparse_memory_binds_;
    std::vector<SparseBufferBind> sparse_buffer_binds_;
-@@ -793,6 +864,24 @@ class VulkanCommandProcessor : public CommandProcessor {
+@@ -793,6 +864,28 @@ class VulkanCommandProcessor : public CommandProcessor {
    // but in_render_pass_ is true.
    VkRenderPass current_render_pass_;
    const VulkanRenderTargetCache::Framebuffer* current_framebuffer_;
@@ -495,7 +495,11 @@ index 696ff48..ead4a6c 100644
 +  VkImage pass_images_[5] = {};
 +  VkImage ended_pass_images_[5] = {};
 +  VkImage next_pass_images_[5] = {};
-+  void EmitAttachmentPassBarrierIfNeeded();
++  // Whether the current / last ended pass is an ownership transfer one (attaching the
++  // render target through a view of the transfer format).
++  bool pass_is_transfer_ = false;
++  bool ended_pass_is_transfer_ = false;
++  void EmitAttachmentPassBarrierIfNeeded(bool next_is_transfer);
 + public:
 +  // [4deviltears] The images the next render pass instance will attach (up to 5).
 +  void SetNextRenderPassImages(const VkImage* images, uint32_t count) {
@@ -7801,7 +7805,7 @@ index 0000000..4812f2a
 +
 +}  // namespace rex::graphics::vulkan::bc_decode
 diff --git a/src/graphics/vulkan/command_processor.cpp b/src/graphics/vulkan/command_processor.cpp
-index 001f36b..2fbcfee 100644
+index 001f36b..7e97c04 100644
 --- a/src/graphics/vulkan/command_processor.cpp
 +++ b/src/graphics/vulkan/command_processor.cpp
 @@ -10,6 +10,8 @@
@@ -7865,7 +7869,7 @@ index 001f36b..2fbcfee 100644
  REXCVAR_DEFINE_BOOL(vulkan_async_skip_incomplete_frames, true, "GPU/Vulkan",
                      "When async shader compilation is enabled, skip presenting frames that "
                      "used placeholder pipelines to avoid visible flashing")
-@@ -69,6 +102,201 @@ REXCVAR_DEFINE_BOOL(vulkan_dynamic_rendering, true, "GPU/Vulkan",
+@@ -69,6 +102,205 @@ REXCVAR_DEFINE_BOOL(vulkan_dynamic_rendering, true, "GPU/Vulkan",
                      "device (falls back to render passes otherwise)")
      .lifecycle(rex::cvar::Lifecycle::kHotReload);
  
@@ -7881,6 +7885,10 @@ index 001f36b..2fbcfee 100644
 +REXCVAR_DEFINE_BOOL(vulkan_pass_to_pass_barrier, true, "GPU/Vulkan",
 +                    "[4DevilTears] Memory barrier between consecutive render passes on the same "
 +                    "attachments (stores of one pass vs loads/stores of the next)")
++    .lifecycle(rex::cvar::Lifecycle::kHotReload);
++REXCVAR_DEFINE_BOOL(vulkan_pass_to_pass_barrier_all, false, "GPU/Vulkan",
++                    "[4DevilTears] Pass-to-pass barrier also between draw passes on the same "
++                    "attachments (not only around ownership transfer passes)")
 +    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 +REXCVAR_DEFINE_BOOL(collapse_predicated_tiling, false, "GPU",
 +                    "[4DevilTears] Experimental: render predicated tiling bands (the scene drawn "
@@ -8067,7 +8075,7 @@ index 001f36b..2fbcfee 100644
  namespace rex::graphics::vulkan {
  
  namespace {
-@@ -580,6 +808,7 @@ VulkanCommandProcessor::VulkanCommandProcessor(VulkanGraphicsSystem* graphics_sy
+@@ -580,6 +812,7 @@ VulkanCommandProcessor::VulkanCommandProcessor(VulkanGraphicsSystem* graphics_sy
                                                 system::KernelState* kernel_state)
      : CommandProcessor(graphics_system, kernel_state),
        deferred_command_buffer_(*this),
@@ -8075,7 +8083,7 @@ index 001f36b..2fbcfee 100644
        transient_descriptor_allocator_uniform_buffer_(
            static_cast<const ui::vulkan::VulkanProvider*>(graphics_system->provider())
                ->vulkan_device(),
-@@ -930,10 +1159,17 @@ bool VulkanCommandProcessor::SetupContext() {
+@@ -930,10 +1163,17 @@ bool VulkanCommandProcessor::SetupContext() {
      return false;
    }
    if (!device_properties.vertexPipelineStoresAndAtomics) {
@@ -8097,7 +8105,7 @@ index 001f36b..2fbcfee 100644
    }
    if (!device_properties.geometryShader) {
      if (REXCVAR_GET(vulkan_require_geometry_shader)) {
-@@ -2057,7 +2293,12 @@ void VulkanCommandProcessor::ShutdownContext() {
+@@ -2057,7 +2297,12 @@ void VulkanCommandProcessor::ShutdownContext() {
    sparse_buffer_binds_.clear();
    sparse_memory_binds_.clear();
  
@@ -8110,7 +8118,7 @@ index 001f36b..2fbcfee 100644
    for (const auto& command_buffer_pair : command_buffers_submitted_) {
      dfn.vkDestroyCommandPool(device, command_buffer_pair.second.pool, nullptr);
    }
-@@ -2269,8 +2510,317 @@ void VulkanCommandProcessor::OnGammaRampPWLValueWritten() {
+@@ -2269,8 +2514,317 @@ void VulkanCommandProcessor::OnGammaRampPWLValueWritten() {
    gamma_ramp_pwl_current_frame_ = UINT32_MAX;
  }
  
@@ -8428,7 +8436,7 @@ index 001f36b..2fbcfee 100644
    SCOPE_profile_cpu_f("gpu");
    vertex_buffers_in_sync_[0] = 0;
    vertex_buffers_in_sync_[1] = 0;
-@@ -2292,6 +2842,19 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
+@@ -2292,6 +2846,19 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
    bool skip_present_due_async_placeholder = REXCVAR_GET(async_shader_compilation) &&
                                              REXCVAR_GET(vulkan_async_skip_incomplete_frames) &&
                                              frame_used_async_placeholder_pipeline_;
@@ -8448,7 +8456,7 @@ index 001f36b..2fbcfee 100644
    if (skip_present_due_async_placeholder) {
      static bool skipped_incomplete_frame_logged = false;
      if (!skipped_incomplete_frame_logged) {
-@@ -2855,7 +3418,8 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
+@@ -2855,7 +3422,8 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
            render_pass_begin_info.renderArea.extent.height = guest_output_height;
            render_pass_begin_info.clearValueCount = 0;
            render_pass_begin_info.pClearValues = nullptr;
@@ -8458,7 +8466,7 @@ index 001f36b..2fbcfee 100644
                                                          VK_SUBPASS_CONTENTS_INLINE);
  
            VkViewport viewport;
-@@ -3091,13 +3655,22 @@ bool VulkanCommandProcessor::SubmitBarriers(bool force_end_render_pass) {
+@@ -3091,13 +3659,22 @@ bool VulkanCommandProcessor::SubmitBarriers(bool force_end_render_pass) {
  void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
      VkRenderPass render_pass, const VulkanRenderTargetCache::Framebuffer* framebuffer) {
    SubmitBarriers(false);
@@ -8482,7 +8490,7 @@ index 001f36b..2fbcfee 100644
        return;
      }
    } else {
-@@ -3107,16 +3680,21 @@ void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
+@@ -3107,16 +3684,22 @@ void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
    }
  
    if (in_render_pass_) {
@@ -8495,6 +8503,7 @@ index 001f36b..2fbcfee 100644
      in_render_pass_ = false;
 +    attachment_pass_barrier_needed_ = true;
 +    std::memcpy(ended_pass_images_, pass_images_, sizeof(pass_images_));
++    ended_pass_is_transfer_ = pass_is_transfer_;
 +    ProfileMark(0);
    }
  
@@ -8504,23 +8513,23 @@ index 001f36b..2fbcfee 100644
  
    if (use_dynamic_rendering) {
      VkRenderingAttachmentInfo color_attachments[xenos::kMaxColorRenderTargets];
-@@ -3141,6 +3719,9 @@ void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
+@@ -3141,6 +3724,9 @@ void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
      rendering_info.pColorAttachments = color_attachment_count ? color_attachments : nullptr;
      rendering_info.pDepthAttachment = has_depth ? &depth_attachment : nullptr;
      rendering_info.pStencilAttachment = has_stencil ? &stencil_attachment : nullptr;
 +    ProfileMark(1, framebuffer->host_extent.width, framebuffer->host_extent.height);
 +    gpu_stats::Add(gpu_stats::kRenderPasses, 1);
-+    EmitAttachmentPassBarrierIfNeeded();
++    EmitAttachmentPassBarrierIfNeeded(false);
      deferred_command_buffer_.CmdVkBeginRendering(&rendering_info);
    } else {
      VkRenderPassBeginInfo render_pass_begin_info;
-@@ -3155,10 +3736,14 @@ void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
+@@ -3155,10 +3741,14 @@ void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
      render_pass_begin_info.renderArea.extent = framebuffer->host_extent;
      render_pass_begin_info.clearValueCount = 0;
      render_pass_begin_info.pClearValues = nullptr;
 +    ProfileMark(1, framebuffer->host_extent.width, framebuffer->host_extent.height);
 +    gpu_stats::Add(gpu_stats::kRenderPasses, 1);
-+    EmitAttachmentPassBarrierIfNeeded();
++    EmitAttachmentPassBarrierIfNeeded(false);
      deferred_command_buffer_.CmdVkBeginRenderPass(&render_pass_begin_info,
                                                    VK_SUBPASS_CONTENTS_INLINE);
    }
@@ -8529,7 +8538,7 @@ index 001f36b..2fbcfee 100644
  }
  
  void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
-@@ -3171,7 +3756,7 @@ void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
+@@ -3171,7 +3761,7 @@ void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
  
    if (use_dynamic_rendering) {
      if (in_render_pass_ && current_framebuffer_ == framebuffer &&
@@ -8538,7 +8547,7 @@ index 001f36b..2fbcfee 100644
        return;
      }
    } else {
-@@ -3181,16 +3766,21 @@ void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
+@@ -3181,16 +3771,22 @@ void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
    }
  
    if (in_render_pass_) {
@@ -8551,6 +8560,7 @@ index 001f36b..2fbcfee 100644
      in_render_pass_ = false;
 +    attachment_pass_barrier_needed_ = true;
 +    std::memcpy(ended_pass_images_, pass_images_, sizeof(pass_images_));
++    ended_pass_is_transfer_ = pass_is_transfer_;
 +    ProfileMark(0);
    }
  
@@ -8560,23 +8570,23 @@ index 001f36b..2fbcfee 100644
  
    if (use_dynamic_rendering) {
      VkRenderingAttachmentInfo color_attachment = {};
-@@ -3235,6 +3825,9 @@ void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
+@@ -3235,6 +3831,9 @@ void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
      rendering_info.pColorAttachments = transfer_dest_is_depth ? nullptr : &color_attachment;
      rendering_info.pDepthAttachment = transfer_dest_is_depth ? &depth_attachment : nullptr;
      rendering_info.pStencilAttachment = transfer_dest_is_depth ? &stencil_attachment : nullptr;
 +    ProfileMark(2, framebuffer->host_extent.width, framebuffer->host_extent.height);
 +    gpu_stats::Add(gpu_stats::kRenderPasses, 1);
-+    EmitAttachmentPassBarrierIfNeeded();
++    EmitAttachmentPassBarrierIfNeeded(true);
      deferred_command_buffer_.CmdVkBeginRendering(&rendering_info);
    } else {
      VkRenderPassBeginInfo render_pass_begin_info;
-@@ -3247,10 +3840,110 @@ void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
+@@ -3247,10 +3846,115 @@ void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
      render_pass_begin_info.renderArea.extent = framebuffer->host_extent;
      render_pass_begin_info.clearValueCount = 0;
      render_pass_begin_info.pClearValues = nullptr;
 +    ProfileMark(2, framebuffer->host_extent.width, framebuffer->host_extent.height);
 +    gpu_stats::Add(gpu_stats::kRenderPasses, 1);
-+    EmitAttachmentPassBarrierIfNeeded();
++    EmitAttachmentPassBarrierIfNeeded(true);
      deferred_command_buffer_.CmdVkBeginRenderPass(&render_pass_begin_info,
                                                    VK_SUBPASS_CONTENTS_INLINE);
    }
@@ -8590,7 +8600,7 @@ index 001f36b..2fbcfee 100644
 +// the next are unordered. On tile-based GPUs that let a transfer instance's store of a few
 +// tiles land after the following draw instance (Mali-G78: the top EDRAM tiles of the frame
 +// kept the transferred bloom data - a flickering band).
-+void VulkanCommandProcessor::EmitAttachmentPassBarrierIfNeeded() {
++void VulkanCommandProcessor::EmitAttachmentPassBarrierIfNeeded(bool next_is_transfer) {
 +  // The images of the pass being started become the current ones.
 +  bool shared = false;
 +  for (VkImage a : next_pass_images_) {
@@ -8602,8 +8612,13 @@ index 001f36b..2fbcfee 100644
 +  bool unknown = next_pass_images_[0] == VK_NULL_HANDLE;
 +  std::memcpy(pass_images_, next_pass_images_, sizeof(pass_images_));
 +  std::memset(next_pass_images_, 0, sizeof(next_pass_images_));
++  bool was_transfer = ended_pass_is_transfer_;
++  pass_is_transfer_ = next_is_transfer;
++  // Passes attaching the image through the same views are ordered by the driver; a pass
++  // through a different view (transfer format <-> draw format) is where Mali-G78 didn't.
 +  if (!attachment_pass_barrier_needed_ || !REXCVAR_GET(vulkan_pass_to_pass_barrier) ||
-+      (!shared && !unknown)) {
++      (!shared && !unknown) || (!unknown && !was_transfer && !next_is_transfer &&
++                                !REXCVAR_GET(vulkan_pass_to_pass_barrier_all))) {
 +    attachment_pass_barrier_needed_ = false;
 +    return;
 +  }
@@ -8681,7 +8696,7 @@ index 001f36b..2fbcfee 100644
  }
  
  void VulkanCommandProcessor::EndRenderPass() {
-@@ -3258,13 +3951,18 @@ void VulkanCommandProcessor::EndRenderPass() {
+@@ -3258,13 +3962,19 @@ void VulkanCommandProcessor::EndRenderPass() {
    if (!in_render_pass_) {
      return;
    }
@@ -8693,6 +8708,7 @@ index 001f36b..2fbcfee 100644
    }
 +  attachment_pass_barrier_needed_ = true;
 +  std::memcpy(ended_pass_images_, pass_images_, sizeof(pass_images_));
++    ended_pass_is_transfer_ = pass_is_transfer_;
 +  ProfileMark(0);
    current_render_pass_ = VK_NULL_HANDLE;
    current_framebuffer_ = nullptr;
@@ -8700,7 +8716,7 @@ index 001f36b..2fbcfee 100644
    in_render_pass_ = false;
  }
  
-@@ -3587,6 +4285,147 @@ Shader* VulkanCommandProcessor::LoadShader(xenos::ShaderType shader_type, uint32
+@@ -3587,6 +4297,147 @@ Shader* VulkanCommandProcessor::LoadShader(xenos::ShaderType shader_type, uint32
    return pipeline_cache_->LoadShader(shader_type, host_address, dword_count);
  }
  
@@ -8848,7 +8864,7 @@ index 001f36b..2fbcfee 100644
  bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
                                         IndexBufferInfo* index_buffer_info,
                                         bool major_mode_explicit) {
-@@ -3594,6 +4433,61 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
+@@ -3594,6 +4445,61 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
    SCOPE_profile_cpu_f("gpu");
  #endif  // XE_GPU_FINE_GRAINED_DRAW_SCOPES
  
@@ -8910,7 +8926,7 @@ index 001f36b..2fbcfee 100644
    const RegisterFile& regs = *register_file_;
    (void)index_buffer_info;
    auto draw_fail = [&](const char* stage) {
-@@ -3629,13 +4523,56 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
+@@ -3629,13 +4535,56 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
      return draw_fail("missing_vertex_shader");
    }
    pipeline_cache_->AnalyzeShaderUcode(*vertex_shader);
@@ -8971,7 +8987,7 @@ index 001f36b..2fbcfee 100644
      }
      draw_util::AddMemExportRanges(regs, *vertex_shader, memexport_ranges_);
    }
-@@ -3681,6 +4618,350 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
+@@ -3681,6 +4630,350 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
    }
    reg::RB_DEPTHCONTROL normalized_depth_control = draw_util::GetNormalizedDepthControl(regs);
  
@@ -9322,7 +9338,7 @@ index 001f36b..2fbcfee 100644
    uint32_t ps_param_gen_pos = UINT32_MAX;
    uint32_t interpolator_mask =
        pixel_shader ? (vertex_shader->writes_interpolators() &
-@@ -4111,14 +5392,22 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
+@@ -4111,14 +5404,22 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
    // After all commands that may dispatch, copy or insert barriers, submit
    // the barriers (may end the render pass), and (re)enter the render pass
    // before drawing.
@@ -9345,7 +9361,7 @@ index 001f36b..2fbcfee 100644
      deferred_command_buffer_.CmdVkDraw(primitive_processing_result.host_draw_vertex_count, 1, 0, 0);
    } else {
      std::pair<VkBuffer, VkDeviceSize> index_buffer;
-@@ -4150,10 +5439,33 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
+@@ -4150,10 +5451,33 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
          primitive_processing_result.host_index_format == xenos::IndexFormat::kInt16
              ? VK_INDEX_TYPE_UINT16
              : VK_INDEX_TYPE_UINT32);
@@ -9379,7 +9395,7 @@ index 001f36b..2fbcfee 100644
    // Invalidate textures in memexported memory and watch for changes.
    if (!memexport_ranges_.empty()) {
      for (const draw_util::MemExportRange& memexport_range : memexport_ranges_) {
-@@ -4382,6 +5694,46 @@ bool VulkanCommandProcessor::IssueDraw_MemexportReadbackFastPath(uint32_t total_
+@@ -4382,6 +5706,46 @@ bool VulkanCommandProcessor::IssueDraw_MemexportReadbackFastPath(uint32_t total_
  }
  
  bool VulkanCommandProcessor::IssueCopy() {
@@ -9426,7 +9442,7 @@ index 001f36b..2fbcfee 100644
  #if XE_GPU_FINE_GRAINED_DRAW_SCOPES
    SCOPE_profile_cpu_f("gpu");
  #endif  // XE_GPU_FINE_GRAINED_DRAW_SCOPES
-@@ -4393,8 +5745,22 @@ bool VulkanCommandProcessor::IssueCopy() {
+@@ -4393,8 +5757,22 @@ bool VulkanCommandProcessor::IssueCopy() {
    ReadbackResolveMode readback_mode = GetReadbackResolveMode(REXCVAR_GET(vulkan_readback_resolve));
    if (readback_mode == ReadbackResolveMode::kDisabled) {
      uint32_t written_address, written_length;
@@ -9451,7 +9467,7 @@ index 001f36b..2fbcfee 100644
    }
  
    return IssueCopy_ReadbackResolvePath();
-@@ -5016,6 +6382,67 @@ void VulkanCommandProcessor::CheckSubmissionFenceAndDeviceLoss(uint64_t await_su
+@@ -5016,6 +6394,67 @@ void VulkanCommandProcessor::CheckSubmissionFenceAndDeviceLoss(uint64_t await_su
                                        submissions_in_flight_fences_awaited_end);
    submission_completed_ += fences_awaited;
  
@@ -9519,7 +9535,7 @@ index 001f36b..2fbcfee 100644
    // Reclaim semaphores.
    while (!submissions_in_flight_semaphores_.empty()) {
      const auto& semaphore_submission = submissions_in_flight_semaphores_.front();
-@@ -5136,6 +6563,29 @@ bool VulkanCommandProcessor::BeginSubmission(bool is_guest_command) {
+@@ -5136,6 +6575,29 @@ bool VulkanCommandProcessor::BeginSubmission(bool is_guest_command) {
      // the end of the submission (when async pipeline object creation requests
      // are fulfilled).
      deferred_command_buffer_.Reset();
@@ -9549,7 +9565,7 @@ index 001f36b..2fbcfee 100644
  
      // Reset cached state of the command buffer.
      dynamic_viewport_update_needed_ = true;
-@@ -5150,6 +6600,7 @@ bool VulkanCommandProcessor::BeginSubmission(bool is_guest_command) {
+@@ -5150,6 +6612,7 @@ bool VulkanCommandProcessor::BeginSubmission(bool is_guest_command) {
      dynamic_stencil_reference_back_update_needed_ = true;
      current_render_pass_ = VK_NULL_HANDLE;
      current_framebuffer_ = nullptr;
@@ -9557,7 +9573,7 @@ index 001f36b..2fbcfee 100644
      in_render_pass_ = false;
      current_guest_graphics_pipeline_ = VK_NULL_HANDLE;
      current_external_graphics_pipeline_ = VK_NULL_HANDLE;
-@@ -5385,7 +6836,67 @@ bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
+@@ -5385,7 +6848,67 @@ bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
        REXGPU_ERROR("Failed to begin a Vulkan command buffer");
        return false;
      }
