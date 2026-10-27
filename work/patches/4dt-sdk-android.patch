@@ -11240,6 +11240,33 @@ index 5709e6d..7497b8d 100644
    REXKRNL_IMPORT_RESULT("NtClose", "{:#x}", result);
    return result;
  }
+diff --git a/src/rexglue/main.cpp b/src/rexglue/main.cpp
+index 201b623..787e894 100644
+--- a/src/rexglue/main.cpp
++++ b/src/rexglue/main.cpp
+@@ -26,6 +26,10 @@
+ #include <rex/platform/env.h>
+ #include <rex/result.h>
+ #include <rex/version.h>
++#include <rex/platform.h>
++#if REX_PLATFORM_ANDROID
++#include <rex/main_android.h>
++#endif
+ 
+ namespace {
+ 
+@@ -57,6 +61,11 @@ void ConfigureLogging(const std::string& level, const std::string& log_file, boo
+ }  // namespace
+ 
+ int main(int argc, char** argv) {
++#if REX_PLATFORM_ANDROID
++  // Run on the phone (the app builds the game code itself): shared memory and threads
++  // need the same Android setup the game gets from its SDL entry point.
++  rex::InitializeAndroidCore();
++#endif
+   CLI::App app{TitleString(), "rexglue"};
+   app.set_version_flag("--version", REXGLUE_VERSION_STRING);
+   app.require_subcommand(1);
 diff --git a/src/system/mmio_handler.cpp b/src/system/mmio_handler.cpp
 index 2b93005..0a892a5 100644
 --- a/src/system/mmio_handler.cpp
