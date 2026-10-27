@@ -10545,7 +10545,7 @@ index 91ac08f..ee976e5 100644
        }
      }
 diff --git a/src/graphics/vulkan/render_target_cache.cpp b/src/graphics/vulkan/render_target_cache.cpp
-index 0298f06..fbd4fb4 100644
+index 0298f06..8d22e12 100644
 --- a/src/graphics/vulkan/render_target_cache.cpp
 +++ b/src/graphics/vulkan/render_target_cache.cpp
 @@ -10,6 +10,7 @@
@@ -10980,7 +10980,7 @@ index 0298f06..fbd4fb4 100644
              float transfer_rectangle_x0 = -1.0f + transfer_rectangle.x_pixels * pixels_to_ndc_x;
              float transfer_rectangle_y0 = -1.0f + transfer_rectangle.y_pixels * pixels_to_ndc_y;
              float transfer_rectangle_x1 =
-@@ -5402,6 +5739,10 @@ void VulkanRenderTargetCache::PerformTransfersAndResolveClears(
+@@ -5402,9 +5739,33 @@ void VulkanRenderTargetCache::PerformTransfersAndResolveClears(
            } break;
          }
        }
@@ -10991,7 +10991,30 @@ index 0298f06..fbd4fb4 100644
        command_buffer.CmdVkClearAttachments(1, &resolve_clear_attachment, 1, &resolve_clear_rect);
      }
    }
-@@ -6021,6 +6362,8 @@ bool VulkanRenderTargetCache::TryResolveCopyDirectly(const draw_util::ResolveInf
++  // [4deviltears] Frame trace checkpoint: destinations right after the shader transfers
++  // (ends the transfer pass - the following draw starts its own).
++  if (frame_trace::Active() && render_target_transfers) {
++    for (uint32_t i = 0; i < render_target_count; ++i) {
++      RenderTarget* rt = render_targets[i];
++      if (!rt || render_target_transfers[i].empty()) continue;
++      RenderTargetKey dk = rt->key();
++      if (dk.is_depth || dk.Is64bpp() || dk.msaa_samples != xenos::MsaaSamples::k1X) continue;
++      auto& vd = *static_cast<VulkanRenderTarget*>(rt);
++      char name[80];
++      std::snprintf(name, sizeof(name), "aftertransfer_key%08X_tiles%u-%u", dk.key,
++                    render_target_transfers[i].front().start_tiles,
++                    render_target_transfers[i].back().end_tiles);
++      command_processor_.TraceDumpImage(
++          vd.image(), GetColorVulkanFormat(dk.GetColorFormat()), 4, dk.GetWidth(),
++          std::min(GetRenderTargetHeight(dk.pitch_tiles_at_32bpp, dk.msaa_samples),
++                   uint32_t(768)),
++          vd.current_stage_mask(), vd.current_access_mask(), vd.current_layout(), name);
++    }
++  }
+ }
+ 
+ VkPipeline VulkanRenderTargetCache::GetDumpPipeline(DumpPipelineKey key) {
+@@ -6021,6 +6382,8 @@ bool VulkanRenderTargetCache::TryResolveCopyDirectly(const draw_util::ResolveInf
  
  bool VulkanRenderTargetCache::DumpRenderTargets(uint32_t dump_base, uint32_t dump_row_length_used,
                                                  uint32_t dump_rows, uint32_t dump_pitch) {
