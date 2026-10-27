@@ -596,10 +596,10 @@ index 7b938b9..52f3f9e 100644
  
    // Thread for asynchronous writing to the storage streams.
 diff --git a/include/rex/graphics/vulkan/render_target_cache.h b/include/rex/graphics/vulkan/render_target_cache.h
-index 34f7033..5701c02 100644
+index 34f7033..691e6b4 100644
 --- a/include/rex/graphics/vulkan/render_target_cache.h
 +++ b/include/rex/graphics/vulkan/render_target_cache.h
-@@ -109,6 +109,53 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
+@@ -109,6 +109,56 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
                 VulkanTextureCache& texture_cache, uint32_t& written_address_out,
                 uint32_t& written_length_out);
  
@@ -631,6 +631,9 @@ index 34f7033..5701c02 100644
 +    bool compatible = false;
 +    // Seen read in a way the alias can't serve - always resolve to memory too.
 +    bool incompatible = false;
++    // Render target and frame of the last fast resolve into the alias.
++    uint32_t last_source_key = 0;
++    uint64_t last_source_frame = 0;
 +  };
 +  // For the texture cache. Returns the alias whose destination starts at the address.
 +  ResolveAlias* FindResolveAlias(uint32_t address);
@@ -653,7 +656,7 @@ index 34f7033..5701c02 100644
    bool Update(bool is_rasterization_done, reg::RB_DEPTHCONTROL normalized_depth_control,
                uint32_t normalized_color_mask, const Shader& vertex_shader) override;
    // Binding information for the last successful update.
-@@ -159,6 +206,8 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
+@@ -159,6 +209,8 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
  
    VkFormat GetDepthVulkanFormat(xenos::DepthRenderTargetFormat format) const;
    VkFormat GetColorVulkanFormat(xenos::ColorRenderTargetFormat format) const;
@@ -662,7 +665,7 @@ index 34f7033..5701c02 100644
    VkFormat GetColorOwnershipTransferVulkanFormat(
        xenos::ColorRenderTargetFormat format,
        xenos::MsaaSamples msaa_samples = xenos::MsaaSamples::k1X,
-@@ -177,6 +226,21 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
+@@ -177,6 +229,21 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
    void RequestPixelShaderInterlockBarrier() override;
  
   private:
@@ -9549,10 +9552,10 @@ index b49e033..c3c647a 100644
  
 diff --git a/src/graphics/vulkan/fast_resolve.cpp b/src/graphics/vulkan/fast_resolve.cpp
 new file mode 100644
-index 0000000..2f0381c
+index 0000000..0271dbe
 --- /dev/null
 +++ b/src/graphics/vulkan/fast_resolve.cpp
-@@ -0,0 +1,583 @@
+@@ -0,0 +1,603 @@
 +/**
 + * [4deviltears] Fast resolves for the Vulkan render target cache.
 + *
@@ -9590,6 +9593,11 @@ index 0000000..2f0381c
 +                     "addresses consumed only as textures")
 +    .range(0, 2)
 +    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
++
++REXCVAR_DEFINE_BOOL(fast_resolve_single_source, false, "GPU",
++                    "[4DevilTears] Fast resolve only for textures written from one render "
++                    "target per frame")
++    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 +
 +namespace rex::graphics::vulkan {
 +
@@ -10041,6 +10049,21 @@ index 0000000..2f0381c
 +  }
 +  if (!alias || alias->incompatible) {
 +    return false;
++  }
++  // [4deviltears] The same texture written from different render targets within one frame
++  // (e.g. the HDR scene, then the final frame into the same address): keep the regular
++  // resolve for it - a texture read between the two must get the first one.
++  if (REXCVAR_GET(fast_resolve_single_source)) {
++    uint64_t frame = command_processor_.GetCurrentFrame();
++    if (alias->last_source_frame == frame && alias->last_source_key != source_key.key) {
++      alias->incompatible = true;
++      REXGPU_INFO("Fast resolve: {:08X} is written from different render targets in one "
++                  "frame - keeping the regular resolve for it",
++                  alias->address);
++      return false;
++    }
++    alias->last_source_frame = frame;
++    alias->last_source_key = source_key.key;
 +  }
 +  if (!alias->written) {
 +    alias->extent_length = 0;
@@ -11090,7 +11113,7 @@ index 6788214..04b716d 100644
    DeferredCommandBuffer& command_buffer = command_processor_.deferred_command_buffer();
    uint64_t submission_current = command_processor_.GetCurrentSubmission();
 diff --git a/src/graphics/vulkan/texture_cache.cpp b/src/graphics/vulkan/texture_cache.cpp
-index ecbd940..8623433 100644
+index ecbd940..96bb249 100644
 --- a/src/graphics/vulkan/texture_cache.cpp
 +++ b/src/graphics/vulkan/texture_cache.cpp
 @@ -27,6 +27,9 @@
@@ -11189,7 +11212,7 @@ index ecbd940..8623433 100644
    VulkanTexture& vulkan_texture = static_cast<VulkanTexture&>(texture);
    TextureKey texture_key = vulkan_texture.key();
  
-@@ -1237,6 +1289,98 @@ bool VulkanTextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture,
+@@ -1237,6 +1289,110 @@ bool VulkanTextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture,
    if (pipeline == VK_NULL_HANDLE) {
      return false;
    }
@@ -11269,6 +11292,18 @@ index ecbd940..8623433 100644
 +                        texture_address, width, height, uint32_t(texture_key.format));
 +          }
 +          gpu_stats::Add(gpu_stats::kAliasCopies, 1);
++          if (frame_trace::Active()) {
++            // Checkpoint: the texture as the following draws will sample it.
++            VkPipelineStageFlags stage;
++            VkAccessFlags access;
++            VkImageLayout layout;
++            GetTextureUsageMasks(VulkanTexture::Usage::kTransferDestination, stage, access,
++                                 layout);
++            char name[48];
++            std::snprintf(name, sizeof(name), "texfromalias_%08X", texture_address);
++            command_processor_.TraceDumpImage(vulkan_texture.image(), host_format.format, 4,
++                                              width, height, stage, access, layout, name);
++          }
 +          if (!load_mips || texture_key.mip_max_level == 0) {
 +            return true;
 +          }
@@ -11288,7 +11323,7 @@ index ecbd940..8623433 100644
    const LoadShaderInfo& load_shader_info = GetLoadShaderInfo(load_shader);
    LoadShaderIndex load_shader_float_convert = kLoadShaderIndexUnknown;
    if (host_format.format == VK_FORMAT_R16G16B16A16_SFLOAT) {
-@@ -1741,6 +1885,57 @@ bool VulkanTextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture,
+@@ -1741,6 +1897,57 @@ bool VulkanTextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture,
          texture_dst_access_mask, texture_old_layout, texture_new_layout);
    }
    command_processor_.SubmitBarriers(true);
@@ -11346,7 +11381,7 @@ index ecbd940..8623433 100644
    VkBufferImageCopy* copy_regions = command_buffer.CmdCopyBufferToImageEmplace(
        scratch_buffer, vulkan_texture.image(), VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
        level_last - level_first + 1);
-@@ -2937,6 +3132,40 @@ bool VulkanTextureCache::Initialize() {
+@@ -2937,6 +3144,40 @@ bool VulkanTextureCache::Initialize() {
            i);
        return false;
      }
