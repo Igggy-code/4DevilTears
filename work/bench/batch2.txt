@@ -1,0 +1,6 @@
+# имя | флаги (только --имя=значение; @clear = очистить кэш шейдеров/конвейеров перед запуском)
+# Пачка 2: кэш уже прогрет пачкой 1. Первый вариант заодно снимает кадр титульного экрана.
+base            |
+spvopt          | --shader_spirv_optimize=true
+fast_math       | --shader_spirv_optimize=true --shader_mul_zero_dx9=false
+base_end        |

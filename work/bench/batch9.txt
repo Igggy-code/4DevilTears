@@ -1,0 +1,3 @@
+# Пачка 9: исправленная очистка XDK (NaN), снимок кадра с распакованными текстурами.
+mobile_rt |
+xenia_rt | --rt_mobile_transfers=false --d3d_clear_hle=false

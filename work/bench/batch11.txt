@@ -1,0 +1,3 @@
+# Пачка 11: очистки XDK по месту (полосы, верхушки колонн), без потери переносов.
+new |
+xenia_rt | --rt_mobile_transfers=false --d3d_clear_hle=false

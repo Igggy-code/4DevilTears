@@ -1,0 +1,7 @@
+# Пачка 26 (v45): лого/имя "DMC 4", диалоговый ролик держится ~18 с (голос + XMALEVEL в логе).
+# 1) геймплей как есть: SOUNDIO + XMALEVEL во время диалога, затем бой (X + стик)
+# 2) геймплей с GPU-профайлером (PROF-строки в бою; FPS ниже - это нормально)
+# 3) ролик со схлопыванием полос (проверка швов на 1/3 и 2/3 высоты)
+gp_plain    | @gameplay --log_xma_levels=true
+gp_profile  | @gameplay --gpu_profile=true
+cs_collapse | @game --collapse_predicated_tiling=true

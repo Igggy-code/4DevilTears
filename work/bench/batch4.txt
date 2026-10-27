@@ -1,0 +1,7 @@
+# имя | флаги (только --имя=значение)
+# Пачка 4: новые умолчания + поиск прохода, который рисует «сетку» на титульном экране
+# (каждый вариант выключает одну группу эффектов; смотрим скриншоты и FPS).
+new_defaults    |
+no_soft_part    | --debug_skip_shaders=A0DB7B7735D69807
+no_particles2   | --debug_skip_shaders=1008C8751B8DDA96
+no_overlays     | --debug_skip_shaders=6F9A4AED8998331E,774361B2B3B9EABE

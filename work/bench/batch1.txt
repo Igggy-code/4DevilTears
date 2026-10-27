@@ -1,0 +1,9 @@
+# имя | флаги (только --имя=значение; @clear = очистить кэш шейдеров/конвейеров перед запуском)
+# Пачка 1: новые умолчания (FMA в пиксельных шейдерах, без компиляции заглушек, показ кадра
+# хотя бы раз в 4 во время компиляции) против оптимизатора SPIR-V и быстрой математики.
+fresh_base      | @clear
+warm_base       |
+fresh_spvopt    | @clear --shader_spirv_optimize=true
+warm_spvopt     | --shader_spirv_optimize=true
+fast_math       | --shader_spirv_optimize=true --shader_mul_zero_dx9=false
+old_style       | @clear --shader_ps_allow_contraction=false --vulkan_async_null_placeholder=false

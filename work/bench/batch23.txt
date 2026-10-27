@@ -1,0 +1,7 @@
+# Пачка 23 (v41): профиль GPU по проходам + опыт со схлопыванием полос (predicated tiling).
+# 1) профиль как есть - куда уходят ~32 мс кадра
+# 2) профиль + сцена рисуется один раз вместо трёх полос (экспериментально!)
+# 3) то же + настоящие запросы видимости
+game_profile  | @game --gpu_profile=true
+game_collapse | @game --gpu_profile=true --collapse_predicated_tiling=true
+game_coll_occ | @game --gpu_profile=true --collapse_predicated_tiling=true --occlusion_query_enable=true

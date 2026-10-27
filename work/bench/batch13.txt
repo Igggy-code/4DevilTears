@@ -1,0 +1,3 @@
+# Пачка 13: игра + константы шейдеров + дамп шейдеров; без очистки XDK для сравнения полос.
+game | @game --dump_shaders=/data/data/com.fourdeviltears.app/files/shaders
+game_nohle | @game --d3d_clear_hle=false

@@ -1,0 +1,8 @@
+# Пачка 25 (v44): геймплей автоматически + схлопывание полос + диагностика звука.
+# @gameplay: ролик -> START, START, A (старт миссии) -> загрузка -> A, A -> бой: X и левый стик.
+# 1) геймплей как есть (трасса снимается в бою: HUD, звук в логе SOUNDIO)
+# 2) геймплей со схлопыванием полос
+# 3) ролик со схлопыванием (картинка: швы на 1/3 и 2/3 высоты?)
+gp_plain    | @gameplay
+gp_collapse | @gameplay --collapse_predicated_tiling=true
+cs_collapse | @game --collapse_predicated_tiling=true

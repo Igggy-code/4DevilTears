@@ -1,0 +1,7 @@
+# Пачка 24 (v43): схлопывание полос с исправленным распознаванием.
+# 1) схлопывание + трасса (в трассе видны смещения полос) - картинка и "band draws skipped"
+# 2) схлопывание без профиля - честный FPS/плавность
+# 3) обычный запуск без профиля - для сравнения
+game_collapse | @game --collapse_predicated_tiling=true
+game_coll_prof| @game --collapse_predicated_tiling=true --gpu_profile=true
+game_plain    | @game

@@ -1,0 +1,3 @@
+# Пачка 10: свои распаковщики DXT (сетка), лог очисток XDK и скриншоты заставок.
+new |
+old_bc | --texture_own_bc_decoders=false

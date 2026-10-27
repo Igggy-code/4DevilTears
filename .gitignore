@@ -1,0 +1,19 @@
+# Game data and anything derived from it never goes into the repository.
+extracted/
+extracted_*/
+*.iso
+*.xex
+*.pe
+default.pe
+2008 Devil May Cry 4/
+434307DF/
+build/
+generated/
+*.apk
+*.so
+work/logs/
+work/tmp_*/
+*.bak
+*.bak[0-9]
+.DS_Store
+local.properties

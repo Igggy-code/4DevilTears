@@ -1,0 +1,13 @@
+# имя | флаги (через пробел, только в виде --имя=значение)
+# Перед каждым вариантом стенд ждёт остывания телефона (BENCH_COOL_TEMP, по умолчанию 37 °C).
+# Первый прогон прогревает кэш конвейеров; baseline повторяется в конце для контроля дрейфа.
+warmup          | --d3d_clear_hle=false
+baseline        | --d3d_clear_hle=false
+aniso_off       | --d3d_clear_hle=false --anisotropic_override=-1
+no_robust       | --d3d_clear_hle=false --vulkan_robust_buffer_access=false
+no_occlusion    | --d3d_clear_hle=false --occlusion_query_enable=false
+no_memexport_rb | --d3d_clear_hle=false --readback_memexport=false
+vsync_off       | --d3d_clear_hle=false --vsync=false
+all_safe        | --d3d_clear_hle=false --anisotropic_override=-1 --vulkan_robust_buffer_access=false --occlusion_query_enable=false --readback_memexport=false
+all_vsync_off   | --d3d_clear_hle=false --anisotropic_override=-1 --vulkan_robust_buffer_access=false --occlusion_query_enable=false --readback_memexport=false --vsync=false
+baseline_end    | --d3d_clear_hle=false

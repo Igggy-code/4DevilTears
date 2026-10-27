@@ -1,0 +1,7 @@
+# Пачка 22 (v39): выборка текстур без явных градиентов (быстрее на мобильных), честное время GPU.
+# 1) по умолчанию (+ видео ролика при BENCH_RECORD=1)
+# 2) старая выборка с градиентами - сравнить время GPU на кадр
+# 3) настоящие запросы видимости (occlusion) - проверка квадратиков/бликов и их цены
+game_default | @game
+game_grad    | @game --shader_tfetch_implicit_lod=false
+game_occl    | @game --occlusion_query_enable=true

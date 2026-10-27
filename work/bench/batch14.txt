@@ -1,0 +1,3 @@
+# Пачка 14: игра без очистки XDK (полосы); правило DX9 0*x=0 для тёмных персонажей.
+game | @game
+game_mz | @game --shader_mul_zero_dx9=true

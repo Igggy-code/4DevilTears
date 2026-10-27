@@ -1,0 +1,13 @@
+# Пачка 18: почему цвет текстур чёрный. Каждая строка - одна теория, по умолчанию всё как было.
+# 1) материал выводит первую UV (по ней берётся цвет) - ждём цветной градиент
+# 2) материал выводит вторую UV (по ней рельеф/блики, они работают) - для сравнения
+# 3) без анизотропной фильтрации (у текстур цвета она 16x, у рабочих - меньше)
+# 4) без LOD-смещения из констант текстуры (оно есть только у текстур цвета)
+# 5) кэш текстур в 4 раза больше (вдруг большие текстуры выталкиваются и перезагружаются)
+# 6) прежние декодеры DXT от Xenia
+game_uv0      | @game --debug_ps_output_register=C32F80189ED74299:i0
+game_uv2      | @game --debug_ps_output_register=C32F80189ED74299:i2
+game_noaniso  | @game --anisotropic_override=0
+game_nolodb   | @game --debug_ignore_fetch_lod_bias=true
+game_bigcache | @game --texture_cache_memory_limit_soft=1536 --texture_cache_memory_limit_hard=3072
+game_xeniadxt | @game --texture_own_bc_decoders=false
