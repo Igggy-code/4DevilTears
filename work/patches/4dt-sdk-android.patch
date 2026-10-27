@@ -374,10 +374,10 @@ index 3da182d..a2d7e9c 100644
    uint32_t rb_depth_clear;
    uint32_t rb_color_clear;
 diff --git a/include/rex/graphics/vulkan/command_processor.h b/include/rex/graphics/vulkan/command_processor.h
-index 696ff48..63e1c15 100644
+index 696ff48..b969323 100644
 --- a/include/rex/graphics/vulkan/command_processor.h
 +++ b/include/rex/graphics/vulkan/command_processor.h
-@@ -47,6 +47,16 @@ namespace rex::graphics::vulkan {
+@@ -47,6 +47,20 @@ namespace rex::graphics::vulkan {
  
  class VulkanCommandProcessor : public CommandProcessor {
   public:
@@ -391,10 +391,14 @@ index 696ff48..63e1c15 100644
 +    if (in_render_pass_) EndRenderPass();
 +    ProfileMark(kind, width, height);
 +  }
++  // [4DevilTears] Describes the segment just marked (for transfers: what is copied to what).
++  void ProfileTagLast(uint64_t tag) {
++    if (profile_active_ && !profile_segments_.empty()) profile_segments_.back().first_ps = tag;
++  }
    // Single-descriptor layouts for use within a single frame.
    enum class SingleTransientDescriptorLayout {
      kStorageBufferCompute,
-@@ -145,10 +155,27 @@ class VulkanCommandProcessor : public CommandProcessor {
+@@ -145,10 +159,27 @@ class VulkanCommandProcessor : public CommandProcessor {
  
    // Returns the deferred drawing command list for the currently open
    // submission.
@@ -422,7 +426,7 @@ index 696ff48..63e1c15 100644
  
    bool submission_open() const { return submission_open_; }
    uint64_t GetCurrentSubmission() const {
-@@ -535,6 +562,7 @@ class VulkanCommandProcessor : public CommandProcessor {
+@@ -535,6 +566,7 @@ class VulkanCommandProcessor : public CommandProcessor {
    // Tracks whether any draw in the current frame used an async placeholder
    // graphics pipeline and may have produced incomplete output.
    bool frame_used_async_placeholder_pipeline_ = false;
@@ -430,7 +434,7 @@ index 696ff48..63e1c15 100644
    // Guest frame index, since some transient resources can be reused across
    // submissions. Values updated in the beginning of a frame.
    uint64_t frame_current_ = 1;
-@@ -552,6 +580,49 @@ class VulkanCommandProcessor : public CommandProcessor {
+@@ -552,6 +584,49 @@ class VulkanCommandProcessor : public CommandProcessor {
    std::vector<CommandBuffer> command_buffers_writable_;
    std::deque<std::pair<uint64_t, CommandBuffer>> command_buffers_submitted_;
    DeferredCommandBuffer deferred_command_buffer_;
@@ -480,7 +484,7 @@ index 696ff48..63e1c15 100644
  
    std::vector<VkSparseMemoryBind> sparse_memory_binds_;
    std::vector<SparseBufferBind> sparse_buffer_binds_;
-@@ -793,6 +864,28 @@ class VulkanCommandProcessor : public CommandProcessor {
+@@ -793,6 +868,28 @@ class VulkanCommandProcessor : public CommandProcessor {
    // but in_render_pass_ is true.
    VkRenderPass current_render_pass_;
    const VulkanRenderTargetCache::Framebuffer* current_framebuffer_;
@@ -7805,7 +7809,7 @@ index 0000000..4812f2a
 +
 +}  // namespace rex::graphics::vulkan::bc_decode
 diff --git a/src/graphics/vulkan/command_processor.cpp b/src/graphics/vulkan/command_processor.cpp
-index 001f36b..7e97c04 100644
+index 001f36b..79e24eb 100644
 --- a/src/graphics/vulkan/command_processor.cpp
 +++ b/src/graphics/vulkan/command_processor.cpp
 @@ -10,6 +10,8 @@
@@ -9467,7 +9471,7 @@ index 001f36b..7e97c04 100644
    }
  
    return IssueCopy_ReadbackResolvePath();
-@@ -5016,6 +6394,67 @@ void VulkanCommandProcessor::CheckSubmissionFenceAndDeviceLoss(uint64_t await_su
+@@ -5016,6 +6394,77 @@ void VulkanCommandProcessor::CheckSubmissionFenceAndDeviceLoss(uint64_t await_su
                                        submissions_in_flight_fences_awaited_end);
    submission_completed_ += fences_awaited;
  
@@ -9485,7 +9489,7 @@ index 001f36b..7e97c04 100644
 +      for (size_t i = 0; i < segments.size(); ++i) {
 +        if (timestamps[i + 1] < timestamps[i]) continue;
 +        const ProfileSegment& segment = segments[i];
-+        char label[96];
++        char label[160];
 +        static const char* const kKinds[] = {"between passes", "draws", "transfer",
 +                                             "resolve", "texture load"};
 +        if (segment.kind == 0) {
@@ -9494,6 +9498,16 @@ index 001f36b..7e97c04 100644
 +          std::snprintf(label, sizeof(label), "resolve %ux%u dst=%08X ctl=%08X", segment.width,
 +                        segment.height, uint32_t(segment.first_ps >> 32),
 +                        uint32_t(segment.first_ps));
++        } else if (segment.kind == 2 && segment.first_ps) {
++          uint64_t t = segment.first_ps;
++          std::snprintf(label, sizeof(label),
++                        "transfer %ux%u %s%u<-%s%u msaa%u/%u stbits=%u n=%u inv=%u tiles=%u",
++                        segment.width, segment.height, (t & 1) ? "D" : "C",
++                        uint32_t(t >> 1) & 0xF, ((t >> 28) & 1) ? "D" : "C",
++                        uint32_t(t >> 29) & 0xF, 1u << (uint32_t(t >> 5) & 3),
++                        1u << (uint32_t(t >> 57) & 3), uint32_t(t >> 7) & 1,
++                        uint32_t(t >> 8) & 0xFF, uint32_t(t >> 16) & 0xFFF,
++                        uint32_t(t >> 33) & 0xFFFF);
 +        } else if (segment.kind >= 3) {
 +          std::snprintf(label, sizeof(label), "%s %ux%u", kKinds[std::min<uint32_t>(segment.kind, 4)],
 +                        segment.width, segment.height);
@@ -9535,7 +9549,7 @@ index 001f36b..7e97c04 100644
    // Reclaim semaphores.
    while (!submissions_in_flight_semaphores_.empty()) {
      const auto& semaphore_submission = submissions_in_flight_semaphores_.front();
-@@ -5136,6 +6575,29 @@ bool VulkanCommandProcessor::BeginSubmission(bool is_guest_command) {
+@@ -5136,6 +6585,29 @@ bool VulkanCommandProcessor::BeginSubmission(bool is_guest_command) {
      // the end of the submission (when async pipeline object creation requests
      // are fulfilled).
      deferred_command_buffer_.Reset();
@@ -9565,7 +9579,7 @@ index 001f36b..7e97c04 100644
  
      // Reset cached state of the command buffer.
      dynamic_viewport_update_needed_ = true;
-@@ -5150,6 +6612,7 @@ bool VulkanCommandProcessor::BeginSubmission(bool is_guest_command) {
+@@ -5150,6 +6622,7 @@ bool VulkanCommandProcessor::BeginSubmission(bool is_guest_command) {
      dynamic_stencil_reference_back_update_needed_ = true;
      current_render_pass_ = VK_NULL_HANDLE;
      current_framebuffer_ = nullptr;
@@ -9573,7 +9587,7 @@ index 001f36b..7e97c04 100644
      in_render_pass_ = false;
      current_guest_graphics_pipeline_ = VK_NULL_HANDLE;
      current_external_graphics_pipeline_ = VK_NULL_HANDLE;
-@@ -5385,7 +6848,67 @@ bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
+@@ -5385,7 +6858,67 @@ bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
        REXGPU_ERROR("Failed to begin a Vulkan command buffer");
        return false;
      }
@@ -10639,7 +10653,7 @@ index 91ac08f..ee976e5 100644
        }
      }
 diff --git a/src/graphics/vulkan/render_target_cache.cpp b/src/graphics/vulkan/render_target_cache.cpp
-index 0298f06..c16ff3e 100644
+index 0298f06..5e212b8 100644
 --- a/src/graphics/vulkan/render_target_cache.cpp
 +++ b/src/graphics/vulkan/render_target_cache.cpp
 @@ -10,6 +10,7 @@
@@ -11060,7 +11074,7 @@ index 0298f06..c16ff3e 100644
    VkClearRect resolve_clear_rect;
    if (resolve_clear_needed) {
      // Assuming the rectangle is already clamped by the setup function from the
-@@ -4964,6 +5301,10 @@ void VulkanRenderTargetCache::PerformTransfersAndResolveClears(
+@@ -4964,8 +5301,32 @@ void VulkanRenderTargetCache::PerformTransfersAndResolveClears(
  
        // Perform the transfers for the render target.
  
@@ -11070,8 +11084,30 @@ index 0298f06..c16ff3e 100644
 +      }
        command_processor_.SubmitBarriersAndEnterRenderTargetCacheRenderPass(
            transfer_render_pass, transfer_framebuffer, transfer_dest_view, dest_rt_key.is_depth);
++      {
++        // GPU profile label: dest / first source formats, stencil bit passes, counts, area.
++        uint64_t area_tiles = 0;
++        for (const Transfer& transfer : current_transfers) {
++          area_tiles += transfer.end_tiles - transfer.start_tiles;
++        }
++        RenderTargetKey source_key = current_transfers.front().source->key();
++        uint64_t tag =
++            uint64_t(dest_rt_key.is_depth) | (uint64_t(dest_rt_key.resource_format & 0xF) << 1) |
++            (uint64_t(uint32_t(dest_rt_key.msaa_samples) & 3) << 5) |
++            (uint64_t(need_stencil_bit_draws) << 7) |
++            (uint64_t(std::min<size_t>(current_transfers.size(), 255)) << 8) |
++            (uint64_t(std::min<size_t>(current_transfer_invocations_.size(), 4095)) << 16) |
++            (uint64_t(source_key.is_depth) << 28) |
++            (uint64_t(source_key.resource_format & 0xF) << 29) |
++            (uint64_t(std::min<uint64_t>(area_tiles, 0xFFFF)) << 33) |
++            (uint64_t(source_key.pitch_tiles_at_32bpp & 0xFF) << 49) |
++            (uint64_t(uint32_t(source_key.msaa_samples) & 3) << 57);
++        command_processor_.ProfileTagLast(tag);
++      }
  
-@@ -4995,6 +5336,10 @@ void VulkanRenderTargetCache::PerformTransfersAndResolveClears(
+       if (stencil_clear_rectangle_count) {
+         VkClearAttachment* stencil_clear_attachment;
+@@ -4995,6 +5356,10 @@ void VulkanRenderTargetCache::PerformTransfersAndResolveClears(
                  stencil_clear_rectangle.height_pixels * draw_resolution_scale_y();
              stencil_clear_rect_write_ptr->baseArrayLayer = 0;
              stencil_clear_rect_write_ptr->layerCount = 1;
@@ -11082,7 +11118,7 @@ index 0298f06..c16ff3e 100644
              ++stencil_clear_rect_write_ptr;
            }
          }
-@@ -5080,6 +5425,11 @@ void VulkanRenderTargetCache::PerformTransfersAndResolveClears(
+@@ -5080,6 +5445,11 @@ void VulkanRenderTargetCache::PerformTransfersAndResolveClears(
            assert_not_zero(transfer_invocation_rectangle_count);
            for (uint32_t j = 0; j < transfer_invocation_rectangle_count; ++j) {
              const Transfer::Rectangle& transfer_rectangle = transfer_invocation_rectangles[j];
@@ -11094,7 +11130,7 @@ index 0298f06..c16ff3e 100644
              float transfer_rectangle_x0 = -1.0f + transfer_rectangle.x_pixels * pixels_to_ndc_x;
              float transfer_rectangle_y0 = -1.0f + transfer_rectangle.y_pixels * pixels_to_ndc_y;
              float transfer_rectangle_x1 =
-@@ -5277,6 +5627,10 @@ void VulkanRenderTargetCache::PerformTransfersAndResolveClears(
+@@ -5277,6 +5647,10 @@ void VulkanRenderTargetCache::PerformTransfersAndResolveClears(
  
      // Perform the clear.
      if (resolve_clear_needed) {
@@ -11105,7 +11141,7 @@ index 0298f06..c16ff3e 100644
        command_processor_.SubmitBarriersAndEnterRenderTargetCacheRenderPass(
            transfer_render_pass, transfer_framebuffer, transfer_dest_view, dest_rt_key.is_depth);
        VkClearAttachment resolve_clear_attachment;
-@@ -5402,9 +5756,33 @@ void VulkanRenderTargetCache::PerformTransfersAndResolveClears(
+@@ -5402,9 +5776,33 @@ void VulkanRenderTargetCache::PerformTransfersAndResolveClears(
            } break;
          }
        }
@@ -11139,7 +11175,7 @@ index 0298f06..c16ff3e 100644
  }
  
  VkPipeline VulkanRenderTargetCache::GetDumpPipeline(DumpPipelineKey key) {
-@@ -6021,6 +6399,8 @@ bool VulkanRenderTargetCache::TryResolveCopyDirectly(const draw_util::ResolveInf
+@@ -6021,6 +6419,8 @@ bool VulkanRenderTargetCache::TryResolveCopyDirectly(const draw_util::ResolveInf
  
  bool VulkanRenderTargetCache::DumpRenderTargets(uint32_t dump_base, uint32_t dump_row_length_used,
                                                  uint32_t dump_rows, uint32_t dump_pitch) {
