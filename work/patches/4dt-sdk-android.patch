@@ -1789,10 +1789,24 @@ index e2983a4..5df6034 100644
  REXCVAR_DEFINE_BOOL(depth_float24_convert_in_pixel_shader, false, "GPU",
                      "Convert float24 depth in pixel shader");
 diff --git a/src/graphics/pipeline/render_target/cache.cpp b/src/graphics/pipeline/render_target/cache.cpp
-index 953c5fd..06def9d 100644
+index 953c5fd..a27ecb3 100644
 --- a/src/graphics/pipeline/render_target/cache.cpp
 +++ b/src/graphics/pipeline/render_target/cache.cpp
-@@ -397,6 +397,47 @@ void RenderTargetCache::BeginFrame() {
+@@ -28,6 +28,13 @@
+ #include <rex/logging.h>
+ #include <rex/math.h>
+ 
++REXCVAR_DEFINE_BOOL(rt_skip_transfers_before_overwrite, true, "GPU",
++                    "[4DevilTears] No ownership transfer into a render target that the current "
++                    "draw overwrites entirely (a single-rectangle clear: depth/stencil written "
++                    "with ALWAYS, or all color channels without blending) - its old contents "
++                    "would be discarded anyway")
++    .lifecycle(rex::cvar::Lifecycle::kHotReload);
++
+ REXCVAR_DEFINE_BOOL(mrt_edram_used_range_clamp_to_min, true, "GPU",
+                     "Clamp MRT EDRAM used range to minimum");
+ 
+@@ -397,6 +404,47 @@ void RenderTargetCache::BeginFrame() {
    ResetAccumulatedRenderTargets();
  }
  
@@ -1840,6 +1854,70 @@ index 953c5fd..06def9d 100644
  bool RenderTargetCache::Update(bool is_rasterization_done,
                                 reg::RB_DEPTHCONTROL normalized_depth_control,
                                 uint32_t normalized_color_mask, const Shader& vertex_shader) {
+@@ -695,6 +743,63 @@ bool RenderTargetCache::Update(bool is_rasterization_done,
+     return true;
+   }
+ 
++  // [4DevilTears] XDK clears are single rectangles drawn over the whole surface, often right
++  // after the same EDRAM range was used by a render target of another format or sample count
++  // (shadow maps over last frame's color, the "4x MSAA" fast clear of the 1x scene). Copying the
++  // old contents into the new render target first is wasted work - on Mali these transfers
++  // (depth with 8 stencil bit passes) cost several milliseconds per frame.
++  if (REXCVAR_GET(rt_skip_transfers_before_overwrite) && is_rasterization_done) {
++    auto vgt_draw_initiator = regs.Get<reg::VGT_DRAW_INITIATOR>();
++    auto rb_colorcontrol = regs.Get<reg::RB_COLORCONTROL>();
++    bool alpha_test_passes = !rb_colorcontrol.alpha_test_enable ||
++                             rb_colorcontrol.alpha_func == xenos::CompareFunction::kAlways;
++    if (vgt_draw_initiator.prim_type == xenos::PrimitiveType::kRectangleList &&
++        vgt_draw_initiator.num_indices == 3 && alpha_test_passes) {
++      for (uint32_t i = 0; i < edram_bases_sorted_count; ++i) {
++        uint32_t rt_bit_index = edram_bases_sorted[i].second;
++        std::vector<Transfer>& transfers = last_update_transfers_[rt_bit_index];
++        if (transfers.empty()) {
++          continue;
++        }
++        bool overwritten;
++        if (!rt_bit_index) {
++          overwritten = normalized_depth_control.z_enable &&
++                        normalized_depth_control.z_write_enable &&
++                        normalized_depth_control.zfunc == xenos::CompareFunction::kAlways;
++          if (overwritten && normalized_depth_control.stencil_enable) {
++            auto stencil_ref_mask = regs.Get<reg::RB_STENCILREFMASK>();
++            overwritten =
++                normalized_depth_control.stencilfunc == xenos::CompareFunction::kAlways &&
++                normalized_depth_control.stencilzpass == xenos::StencilOp::kReplace &&
++                stencil_ref_mask.stencilwritemask == 0xFF;
++          }
++        } else {
++          uint32_t color_index = rt_bit_index - 1;
++          auto blend = regs.Get<reg::RB_BLENDCONTROL>(
++              reg::RB_BLENDCONTROL::rt_register_indices[color_index]);
++          overwritten = ((normalized_color_mask >> (4 * color_index)) & 0xF) == 0xF &&
++                        blend.color_srcblend == xenos::BlendFactor::kOne &&
++                        blend.color_destblend == xenos::BlendFactor::kZero &&
++                        blend.color_comb_fcn == xenos::BlendOp::kAdd &&
++                        blend.alpha_srcblend == xenos::BlendFactor::kOne &&
++                        blend.alpha_destblend == xenos::BlendFactor::kZero &&
++                        blend.alpha_comb_fcn == xenos::BlendOp::kAdd;
++        }
++        if (overwritten) {
++          static uint32_t logged = 0;
++          if (logged < 8) {
++            ++logged;
++            REXGPU_INFO("RT transfers skipped: {} into {} {} at {} (overwritten by a clear)",
++                        transfers.size(), rt_bit_index ? "color" : "depth",
++                        uint32_t(rts[rt_bit_index]->key().resource_format),
++                        rts[rt_bit_index]->key().base_tiles);
++          }
++          transfers.clear();
++        }
++      }
++    }
++  }
++
+   // If everything succeeded, update the used render targets.
+   for (uint32_t i = 0; i < 1 + xenos::kMaxColorRenderTargets; ++i) {
+     last_update_used_render_targets_[i] =
 diff --git a/src/graphics/pipeline/shader/spirv_builder.cpp b/src/graphics/pipeline/shader/spirv_builder.cpp
 index fe0aa4e..ea92656 100644
 --- a/src/graphics/pipeline/shader/spirv_builder.cpp
