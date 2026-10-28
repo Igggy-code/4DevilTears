@@ -7978,7 +7978,7 @@ index 0000000..4812f2a
 +
 +}  // namespace rex::graphics::vulkan::bc_decode
 diff --git a/src/graphics/vulkan/command_processor.cpp b/src/graphics/vulkan/command_processor.cpp
-index 001f36b..bf20708 100644
+index 001f36b..fb37efa 100644
 --- a/src/graphics/vulkan/command_processor.cpp
 +++ b/src/graphics/vulkan/command_processor.cpp
 @@ -10,6 +10,8 @@
@@ -9216,7 +9216,7 @@ index 001f36b..bf20708 100644
      }
      draw_util::AddMemExportRanges(regs, *vertex_shader, memexport_ranges_);
    }
-@@ -3681,6 +4686,350 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
+@@ -3681,6 +4686,352 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
    }
    reg::RB_DEPTHCONTROL normalized_depth_control = draw_util::GetNormalizedDepthControl(regs);
  
@@ -9526,9 +9526,11 @@ index 001f36b..bf20708 100644
 +        }
 +      }
 +      for (uint32_t t = 0; t < target_count; ++t) {
-+        render_target_cache_->HleClearEdram(targets[t].base, pitch_tiles, targets[t].is_depth,
-+                                            targets[t].format, first_row, end_row, color,
-+                                            depth, stencil);
++        if (!render_target_cache_->HleClearEdram(targets[t].base, pitch_tiles,
++                                                 targets[t].is_depth, targets[t].format,
++                                                 first_row, end_row, color, depth, stencil)) {
++          return "owner of another format";  // the draw (re)does the whole clear
++        }
 +      }
 +      gpu_stats::Add(gpu_stats::kHleClears, 1);
 +      pass_area_patchable_ = false;
@@ -9567,7 +9569,7 @@ index 001f36b..bf20708 100644
    uint32_t ps_param_gen_pos = UINT32_MAX;
    uint32_t interpolator_mask =
        pixel_shader ? (vertex_shader->writes_interpolators() &
-@@ -3835,6 +5184,7 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
+@@ -3835,6 +5186,7 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
    uint32_t used_texture_mask =
        vertex_shader->GetUsedTextureMaskAfterTranslation() |
        (pixel_shader != nullptr ? pixel_shader->GetUsedTextureMaskAfterTranslation() : 0);
@@ -9575,7 +9577,7 @@ index 001f36b..bf20708 100644
    texture_cache_->RequestTextures(used_texture_mask);
  
    const VulkanPipelineCache::PipelineLayoutProvider* pipeline_layout_provider;
-@@ -4111,14 +5461,22 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
+@@ -4111,14 +5463,22 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
    // After all commands that may dispatch, copy or insert barriers, submit
    // the barriers (may end the render pass), and (re)enter the render pass
    // before drawing.
@@ -9598,7 +9600,7 @@ index 001f36b..bf20708 100644
      deferred_command_buffer_.CmdVkDraw(primitive_processing_result.host_draw_vertex_count, 1, 0, 0);
    } else {
      std::pair<VkBuffer, VkDeviceSize> index_buffer;
-@@ -4150,10 +5508,33 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
+@@ -4150,10 +5510,33 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
          primitive_processing_result.host_index_format == xenos::IndexFormat::kInt16
              ? VK_INDEX_TYPE_UINT16
              : VK_INDEX_TYPE_UINT32);
@@ -9632,7 +9634,7 @@ index 001f36b..bf20708 100644
    // Invalidate textures in memexported memory and watch for changes.
    if (!memexport_ranges_.empty()) {
      for (const draw_util::MemExportRange& memexport_range : memexport_ranges_) {
-@@ -4382,6 +5763,46 @@ bool VulkanCommandProcessor::IssueDraw_MemexportReadbackFastPath(uint32_t total_
+@@ -4382,6 +5765,46 @@ bool VulkanCommandProcessor::IssueDraw_MemexportReadbackFastPath(uint32_t total_
  }
  
  bool VulkanCommandProcessor::IssueCopy() {
@@ -9679,7 +9681,7 @@ index 001f36b..bf20708 100644
  #if XE_GPU_FINE_GRAINED_DRAW_SCOPES
    SCOPE_profile_cpu_f("gpu");
  #endif  // XE_GPU_FINE_GRAINED_DRAW_SCOPES
-@@ -4393,8 +5814,22 @@ bool VulkanCommandProcessor::IssueCopy() {
+@@ -4393,8 +5816,22 @@ bool VulkanCommandProcessor::IssueCopy() {
    ReadbackResolveMode readback_mode = GetReadbackResolveMode(REXCVAR_GET(vulkan_readback_resolve));
    if (readback_mode == ReadbackResolveMode::kDisabled) {
      uint32_t written_address, written_length;
@@ -9704,7 +9706,7 @@ index 001f36b..bf20708 100644
    }
  
    return IssueCopy_ReadbackResolvePath();
-@@ -5016,6 +6451,77 @@ void VulkanCommandProcessor::CheckSubmissionFenceAndDeviceLoss(uint64_t await_su
+@@ -5016,6 +6453,77 @@ void VulkanCommandProcessor::CheckSubmissionFenceAndDeviceLoss(uint64_t await_su
                                        submissions_in_flight_fences_awaited_end);
    submission_completed_ += fences_awaited;
  
@@ -9782,7 +9784,7 @@ index 001f36b..bf20708 100644
    // Reclaim semaphores.
    while (!submissions_in_flight_semaphores_.empty()) {
      const auto& semaphore_submission = submissions_in_flight_semaphores_.front();
-@@ -5136,6 +6642,29 @@ bool VulkanCommandProcessor::BeginSubmission(bool is_guest_command) {
+@@ -5136,6 +6644,29 @@ bool VulkanCommandProcessor::BeginSubmission(bool is_guest_command) {
      // the end of the submission (when async pipeline object creation requests
      // are fulfilled).
      deferred_command_buffer_.Reset();
@@ -9812,7 +9814,7 @@ index 001f36b..bf20708 100644
  
      // Reset cached state of the command buffer.
      dynamic_viewport_update_needed_ = true;
-@@ -5150,6 +6679,7 @@ bool VulkanCommandProcessor::BeginSubmission(bool is_guest_command) {
+@@ -5150,6 +6681,7 @@ bool VulkanCommandProcessor::BeginSubmission(bool is_guest_command) {
      dynamic_stencil_reference_back_update_needed_ = true;
      current_render_pass_ = VK_NULL_HANDLE;
      current_framebuffer_ = nullptr;
@@ -9820,7 +9822,7 @@ index 001f36b..bf20708 100644
      in_render_pass_ = false;
      current_guest_graphics_pipeline_ = VK_NULL_HANDLE;
      current_external_graphics_pipeline_ = VK_NULL_HANDLE;
-@@ -5385,7 +6915,81 @@ bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
+@@ -5385,7 +6917,81 @@ bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
        REXGPU_ERROR("Failed to begin a Vulkan command buffer");
        return false;
      }
@@ -10959,7 +10961,7 @@ index 91ac08f..ee976e5 100644
        }
      }
 diff --git a/src/graphics/vulkan/render_target_cache.cpp b/src/graphics/vulkan/render_target_cache.cpp
-index 0298f06..ea1b25b 100644
+index 0298f06..cf2f37a 100644
 --- a/src/graphics/vulkan/render_target_cache.cpp
 +++ b/src/graphics/vulkan/render_target_cache.cpp
 @@ -10,6 +10,7 @@
@@ -11135,7 +11137,7 @@ index 0298f06..ea1b25b 100644
      draw_util::ResolveCopyShaderConstants copy_shader_constants;
      uint32_t copy_group_count_x, copy_group_count_y;
      draw_util::ResolveCopyShaderIndex copy_shader =
-@@ -1374,9 +1490,117 @@ bool VulkanRenderTargetCache::Resolve(const memory::Memory& memory,
+@@ -1374,9 +1490,132 @@ bool VulkanRenderTargetCache::Resolve(const memory::Memory& memory,
      cleared = true;
    }
  
@@ -11205,6 +11207,21 @@ index 0298f06..ea1b25b 100644
 +  if (!PackHleClearValue(is_depth, guest_format, color, depth, stencil, own_value)) {
 +    return false;
 +  }
++  // [4DevilTears] Only when the owners hold the same kind of data in the same format: a clear
++  // whose EDRAM range is currently another format's surface (logo screens: a 2_10_10_10
++  // clear over an 8_8_8_8 frame) left visible coloured bands - the draw is used then.
++  for (const EdramOwner& owner : owners) {
++    if (!owner.render_target) {
++      continue;
++    }
++    RenderTargetKey key = owner.render_target->key();
++    uint32_t owner_format =
++        key.is_depth ? uint32_t(key.GetDepthFormat()) : uint32_t(key.GetColorFormat());
++    if (bool(key.is_depth) != is_depth || key.resource_format != own_key.resource_format) {
++      return false;
++    }
++    (void)owner_format;
++  }
 +  bool any = false;
 +  for (const EdramOwner& owner : owners) {
 +    RenderTarget* render_target = owner.render_target;
@@ -11253,7 +11270,7 @@ index 0298f06..ea1b25b 100644
  bool VulkanRenderTargetCache::Update(bool is_rasterization_done,
                                       reg::RB_DEPTHCONTROL normalized_depth_control,
                                       uint32_t normalized_color_mask, const Shader& vertex_shader) {
-@@ -1531,7 +1755,12 @@ void VulkanRenderTargetCache::GetLastUpdateRenderingAttachments(
+@@ -1531,7 +1770,12 @@ void VulkanRenderTargetCache::GetLastUpdateRenderingAttachments(
      depth_attachment->resolveMode = VK_RESOLVE_MODE_NONE;
      depth_attachment->resolveImageView = VK_NULL_HANDLE;
      depth_attachment->resolveImageLayout = VK_IMAGE_LAYOUT_UNDEFINED;
@@ -11267,7 +11284,7 @@ index 0298f06..ea1b25b 100644
      depth_attachment->storeOp = VK_ATTACHMENT_STORE_OP_STORE;
      depth_attachment->clearValue = {};
      *stencil_attachment = *depth_attachment;
-@@ -1550,7 +1779,10 @@ void VulkanRenderTargetCache::GetLastUpdateRenderingAttachments(
+@@ -1550,7 +1794,10 @@ void VulkanRenderTargetCache::GetLastUpdateRenderingAttachments(
        color_attachment.resolveMode = VK_RESOLVE_MODE_NONE;
        color_attachment.resolveImageView = VK_NULL_HANDLE;
        color_attachment.resolveImageLayout = VK_IMAGE_LAYOUT_UNDEFINED;
@@ -11279,7 +11296,7 @@ index 0298f06..ea1b25b 100644
        color_attachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
        color_attachment.clearValue = {};
        color_attachment_count = i + 1;
-@@ -1880,7 +2112,11 @@ RenderTargetCache::RenderTarget* VulkanRenderTargetCache::CreateRenderTarget(Ren
+@@ -1880,7 +2127,11 @@ RenderTargetCache::RenderTarget* VulkanRenderTargetCache::CreateRenderTarget(Ren
      image_create_info.samples = VkSampleCountFlagBits(uint32_t(1) << uint32_t(key.msaa_samples));
    }
    image_create_info.tiling = VK_IMAGE_TILING_OPTIMAL;
@@ -11292,7 +11309,7 @@ index 0298f06..ea1b25b 100644
    image_create_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
    image_create_info.queueFamilyIndexCount = 0;
    image_create_info.pQueueFamilyIndices = nullptr;
-@@ -1901,6 +2137,19 @@ RenderTargetCache::RenderTarget* VulkanRenderTargetCache::CreateRenderTarget(Ren
+@@ -1901,6 +2152,19 @@ RenderTargetCache::RenderTarget* VulkanRenderTargetCache::CreateRenderTarget(Ren
      }
      image_create_info.usage |= VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
    }
@@ -11312,7 +11329,7 @@ index 0298f06..ea1b25b 100644
    if (image_create_info.format == VK_FORMAT_UNDEFINED) {
      REXGPU_ERROR("VulkanRenderTargetCache: Unknown {} render target format {}",
                   key.is_depth ? "depth" : "color", static_cast<uint32_t>(key.resource_format));
-@@ -4546,6 +4795,84 @@ VkPipeline const* VulkanRenderTargetCache::GetTransferPipelines(TransferPipeline
+@@ -4546,6 +4810,84 @@ VkPipeline const* VulkanRenderTargetCache::GetTransferPipelines(TransferPipeline
    return transfer_pipelines_.emplace(key, pipelines).first->second.data();
  }
  
@@ -11397,7 +11414,7 @@ index 0298f06..ea1b25b 100644
  void VulkanRenderTargetCache::PerformTransfersAndResolveClears(
      uint32_t render_target_count, RenderTarget* const* render_targets,
      const std::vector<Transfer>* render_target_transfers,
-@@ -4558,6 +4885,67 @@ void VulkanRenderTargetCache::PerformTransfersAndResolveClears(
+@@ -4558,6 +4900,67 @@ void VulkanRenderTargetCache::PerformTransfersAndResolveClears(
    DeferredCommandBuffer& command_buffer = command_processor_.deferred_command_buffer();
  
    bool resolve_clear_needed = render_target_resolve_clear_values && resolve_clear_rectangle;
@@ -11465,7 +11482,7 @@ index 0298f06..ea1b25b 100644
    VkClearRect resolve_clear_rect;
    if (resolve_clear_needed) {
      // Assuming the rectangle is already clamped by the setup function from the
-@@ -4896,6 +5284,9 @@ void VulkanRenderTargetCache::PerformTransfersAndResolveClears(
+@@ -4896,6 +5299,9 @@ void VulkanRenderTargetCache::PerformTransfersAndResolveClears(
              stencil_clear_rectangle_count += transfer.GetRectangles(
                  dest_rt_key.base_tiles, dest_pitch_tiles, dest_rt_key.msaa_samples, dest_is_64bpp,
                  nullptr, resolve_clear_rectangle);
@@ -11475,7 +11492,7 @@ index 0298f06..ea1b25b 100644
            } else {
              if (dest_rt_key.is_depth) {
                if (host_depth_source_vulkan_rt) {
-@@ -4964,8 +5355,32 @@ void VulkanRenderTargetCache::PerformTransfersAndResolveClears(
+@@ -4964,8 +5370,32 @@ void VulkanRenderTargetCache::PerformTransfersAndResolveClears(
  
        // Perform the transfers for the render target.
  
@@ -11508,7 +11525,7 @@ index 0298f06..ea1b25b 100644
  
        if (stencil_clear_rectangle_count) {
          VkClearAttachment* stencil_clear_attachment;
-@@ -4995,6 +5410,10 @@ void VulkanRenderTargetCache::PerformTransfersAndResolveClears(
+@@ -4995,6 +5425,10 @@ void VulkanRenderTargetCache::PerformTransfersAndResolveClears(
                  stencil_clear_rectangle.height_pixels * draw_resolution_scale_y();
              stencil_clear_rect_write_ptr->baseArrayLayer = 0;
              stencil_clear_rect_write_ptr->layerCount = 1;
@@ -11519,7 +11536,7 @@ index 0298f06..ea1b25b 100644
              ++stencil_clear_rect_write_ptr;
            }
          }
-@@ -5080,6 +5499,11 @@ void VulkanRenderTargetCache::PerformTransfersAndResolveClears(
+@@ -5080,6 +5514,11 @@ void VulkanRenderTargetCache::PerformTransfersAndResolveClears(
            assert_not_zero(transfer_invocation_rectangle_count);
            for (uint32_t j = 0; j < transfer_invocation_rectangle_count; ++j) {
              const Transfer::Rectangle& transfer_rectangle = transfer_invocation_rectangles[j];
@@ -11531,7 +11548,7 @@ index 0298f06..ea1b25b 100644
              float transfer_rectangle_x0 = -1.0f + transfer_rectangle.x_pixels * pixels_to_ndc_x;
              float transfer_rectangle_y0 = -1.0f + transfer_rectangle.y_pixels * pixels_to_ndc_y;
              float transfer_rectangle_x1 =
-@@ -5277,6 +5701,10 @@ void VulkanRenderTargetCache::PerformTransfersAndResolveClears(
+@@ -5277,6 +5716,10 @@ void VulkanRenderTargetCache::PerformTransfersAndResolveClears(
  
      // Perform the clear.
      if (resolve_clear_needed) {
@@ -11542,7 +11559,7 @@ index 0298f06..ea1b25b 100644
        command_processor_.SubmitBarriersAndEnterRenderTargetCacheRenderPass(
            transfer_render_pass, transfer_framebuffer, transfer_dest_view, dest_rt_key.is_depth);
        VkClearAttachment resolve_clear_attachment;
-@@ -5402,9 +5830,33 @@ void VulkanRenderTargetCache::PerformTransfersAndResolveClears(
+@@ -5402,9 +5845,33 @@ void VulkanRenderTargetCache::PerformTransfersAndResolveClears(
            } break;
          }
        }
@@ -11576,7 +11593,7 @@ index 0298f06..ea1b25b 100644
  }
  
  VkPipeline VulkanRenderTargetCache::GetDumpPipeline(DumpPipelineKey key) {
-@@ -6021,6 +6473,8 @@ bool VulkanRenderTargetCache::TryResolveCopyDirectly(const draw_util::ResolveInf
+@@ -6021,6 +6488,8 @@ bool VulkanRenderTargetCache::TryResolveCopyDirectly(const draw_util::ResolveInf
  
  bool VulkanRenderTargetCache::DumpRenderTargets(uint32_t dump_base, uint32_t dump_row_length_used,
                                                  uint32_t dump_rows, uint32_t dump_pitch) {
