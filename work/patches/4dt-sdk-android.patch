@@ -2334,10 +2334,18 @@ index b52bf39..2cdcd55 100644
  
  namespace rex {
 diff --git a/src/core/threading_posix.cpp b/src/core/threading_posix.cpp
-index 9ac8d15..291e77d 100644
+index 9ac8d15..b53e106 100644
 --- a/src/core/threading_posix.cpp
 +++ b/src/core/threading_posix.cpp
-@@ -36,6 +36,7 @@ static_assert(REX_PLATFORM_LINUX || REX_PLATFORM_MAC, "This file is POSIX-only")
+@@ -8,6 +8,7 @@
+ 
+ #include <rex/platform.h>
+ #include <rex/thread.h>
++#include <rex/thread/mutex.h>
+ 
+ static_assert(REX_PLATFORM_LINUX || REX_PLATFORM_MAC, "This file is POSIX-only");
+ 
+@@ -36,6 +37,7 @@ static_assert(REX_PLATFORM_LINUX || REX_PLATFORM_MAC, "This file is POSIX-only")
  #include <unistd.h>
  
  #include <rex/assert.h>
@@ -2345,7 +2353,7 @@ index 9ac8d15..291e77d 100644
  #include <rex/chrono/chrono_steady_cast.h>
  #include <rex/logging.h>
  #include <rex/thread/timer_queue.h>
-@@ -183,7 +184,31 @@ uint32_t current_thread_system_id() {
+@@ -183,7 +185,31 @@ uint32_t current_thread_system_id() {
  #endif
  }
  
@@ -2377,7 +2385,7 @@ index 9ac8d15..291e77d 100644
    sched_yield();
    __sync_synchronize();
  }
-@@ -270,7 +295,7 @@ static sem_t* RexCreateAnonymousSemaphore() {
+@@ -270,7 +296,7 @@ static sem_t* RexCreateAnonymousSemaphore() {
  class PosixConditionBase {
   public:
    PosixConditionBase() {
@@ -2386,7 +2394,7 @@ index 9ac8d15..291e77d 100644
      // Use robust mutexes so waits can recover if owner thread terminates.
      pthread_mutexattr_t attr;
      if (pthread_mutexattr_init(&attr) == 0) {
-@@ -287,10 +312,21 @@ class PosixConditionBase {
+@@ -287,10 +313,21 @@ class PosixConditionBase {
    virtual ~PosixConditionBase() = default;
    virtual bool Signal() = 0;
  
@@ -2409,7 +2417,7 @@ index 9ac8d15..291e77d 100644
      auto native_mutex = static_cast<pthread_mutex_t*>(mutex_.native_handle());
      int lock_result = pthread_mutex_lock(native_mutex);
      if (lock_result == EOWNERDEAD) {
-@@ -336,6 +372,7 @@ class PosixConditionBase {
+@@ -336,6 +373,7 @@ class PosixConditionBase {
                          : start_time + timeout;
  
      while (true) {
@@ -2417,7 +2425,7 @@ index 9ac8d15..291e77d 100644
        size_t first_signaled = std::numeric_limits<size_t>::max();
        bool condition_met = false;
        bool all_locked = true;
-@@ -344,7 +381,7 @@ class PosixConditionBase {
+@@ -344,7 +382,7 @@ class PosixConditionBase {
        locks.reserve(handles.size());
  
        for (size_t i = 0; i < handles.size(); ++i) {
@@ -2426,7 +2434,7 @@ index 9ac8d15..291e77d 100644
          auto native_mutex = static_cast<pthread_mutex_t*>(handles[i]->mutex_.native_handle());
          int result = pthread_mutex_trylock(native_mutex);
          if (result == 0 || result == EOWNERDEAD) {
-@@ -411,12 +448,17 @@ class PosixConditionBase {
+@@ -411,12 +449,17 @@ class PosixConditionBase {
          return std::make_pair<WaitResult, size_t>(WaitResult::kTimeout, 0);
        }
  
@@ -2450,7 +2458,7 @@ index 9ac8d15..291e77d 100644
        }
      }
    }
-@@ -430,6 +472,11 @@ class PosixConditionBase {
+@@ -430,6 +473,11 @@ class PosixConditionBase {
    inline virtual void post_execution() = 0;
    std::condition_variable cond_;
    std::mutex mutex_;
@@ -2462,7 +2470,7 @@ index 9ac8d15..291e77d 100644
  };
  
  // There really is no native POSIX handle for a single wait/signal construct
-@@ -450,6 +497,7 @@ class PosixCondition<Event> : public PosixConditionBase {
+@@ -450,6 +498,7 @@ class PosixCondition<Event> : public PosixConditionBase {
      auto lock = std::unique_lock<std::mutex>(mutex_);
      signal_ = true;
      cond_.notify_all();
@@ -2470,7 +2478,7 @@ index 9ac8d15..291e77d 100644
      return true;
    }
  
-@@ -487,6 +535,7 @@ class PosixCondition<Semaphore> : public PosixConditionBase {
+@@ -487,6 +536,7 @@ class PosixCondition<Semaphore> : public PosixConditionBase {
      }
      count_ += release_count;
      cond_.notify_all();
@@ -2478,7 +2486,7 @@ index 9ac8d15..291e77d 100644
      return true;
    }
  
-@@ -519,6 +568,7 @@ class PosixCondition<Mutant> : public PosixConditionBase {
+@@ -519,6 +569,7 @@ class PosixCondition<Mutant> : public PosixConditionBase {
        // Free to be acquired by another thread
        if (count_ == 0) {
          cond_.notify_all();
@@ -2486,7 +2494,7 @@ index 9ac8d15..291e77d 100644
        }
        return true;
      }
-@@ -551,6 +601,7 @@ class PosixCondition<Timer> : public PosixConditionBase {
+@@ -551,6 +602,7 @@ class PosixCondition<Timer> : public PosixConditionBase {
      std::lock_guard<std::mutex> lock(mutex_);
      signal_ = true;
      cond_.notify_all();
@@ -2494,7 +2502,7 @@ index 9ac8d15..291e77d 100644
      return true;
    }
  
-@@ -979,6 +1030,7 @@ class PosixCondition<Thread> : public PosixConditionBase {
+@@ -979,6 +1031,7 @@ class PosixCondition<Thread> : public PosixConditionBase {
        exit_code_ = exit_code;
        signaled_ = true;
        cond_.notify_all();
@@ -2502,7 +2510,7 @@ index 9ac8d15..291e77d 100644
      }
      if (is_current_thread) {
        pthread_exit(reinterpret_cast<void*>(exit_code));
-@@ -1398,6 +1450,21 @@ class PosixThread : public PosixConditionHandle<Thread> {
+@@ -1398,6 +1451,46 @@ class PosixThread : public PosixConditionHandle<Thread> {
  
  thread_local PosixThread* current_thread_ = nullptr;
  
@@ -2510,21 +2518,46 @@ index 9ac8d15..291e77d 100644
 +static thread_local int host_code_depth_ = 0;
 +static thread_local volatile int suspend_pending_ = 0;
 +
-+void EnterHostCode() { ++host_code_depth_; }
++// Whether this thread owns the global critical region. Recompiled guest code takes it
++// directly for its interrupt-disabled sections (mtmsrd r13 ... mtmsrd), outside any host
++// function, so a guest-requested suspension landing there parked the thread with the lock
++// held and every other thread (memory, GPU, audio, waits) piled up behind it.
++// Bionic keeps the owner's tid in recursive mutexes (pthread_mutex_internal_t:
++// state u16, pad u16, owner_tid int); a read from the signal handler is safe.
++static bool OwnsGlobalLock() {
++#if REX_PLATFORM_ANDROID
++  auto* m = global_critical_region::mutex().native_handle();
++  const auto* words = reinterpret_cast<const volatile int32_t*>(m);
++  return words[1] == static_cast<int32_t>(gettid());
++#else
++  return false;
++#endif
++}
 +
-+void LeaveHostCode() {
-+  if (--host_code_depth_ > 0) return;
-+  host_code_depth_ = 0;
-+  while (suspend_pending_ > 0) {
++static void RunPendingSuspend() {
++  while (suspend_pending_ > 0 && !OwnsGlobalLock()) {
 +    suspend_pending_ = suspend_pending_ - 1;
 +    if (current_thread_) current_thread_->WaitSuspended();
 +  }
 +}
 +
++void EnterHostCode() {
++  // A suspension deferred inside a guest lock section: take it before the next host
++  // call, once the guest has let the lock go.
++  if (host_code_depth_ == 0 && suspend_pending_ > 0) RunPendingSuspend();
++  ++host_code_depth_;
++}
++
++void LeaveHostCode() {
++  if (--host_code_depth_ > 0) return;
++  host_code_depth_ = 0;
++  RunPendingSuspend();
++}
++
  void* PosixCondition<Thread>::ThreadStartRoutine(void* parameter) {
  #if !REX_PLATFORM_ANDROID
    if (pthread_setcanceltype(PTHREAD_CANCEL_ASYNCHRONOUS, nullptr) != 0) {
-@@ -1449,6 +1516,7 @@ void* PosixCondition<Thread>::ThreadStartRoutine(void* parameter) {
+@@ -1449,6 +1542,7 @@ void* PosixCondition<Thread>::ThreadStartRoutine(void* parameter) {
      thread->handle_.exit_code_ = 0;
      thread->handle_.signaled_ = true;
      thread->handle_.cond_.notify_all();
@@ -2532,12 +2565,12 @@ index 9ac8d15..291e77d 100644
    }
  
    current_thread_ = nullptr;
-@@ -1527,6 +1595,11 @@ static void signal_handler(int signal, siginfo_t* /*info*/, void* /*context*/) {
+@@ -1527,6 +1621,11 @@ static void signal_handler(int signal, siginfo_t* /*info*/, void* /*context*/) {
        if (!current_thread_) {
          return;
        }
 +      // Inside host code (maybe holding host locks): suspend when it is left.
-+      if (host_code_depth_ > 0) {
++      if (host_code_depth_ > 0 || OwnsGlobalLock()) {
 +        suspend_pending_ = suspend_pending_ + 1;
 +        return;
 +      }
