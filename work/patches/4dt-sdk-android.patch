@@ -9987,10 +9987,10 @@ index b49e033..c3c647a 100644
  
 diff --git a/src/graphics/vulkan/fast_resolve.cpp b/src/graphics/vulkan/fast_resolve.cpp
 new file mode 100644
-index 0000000..0365ab3
+index 0000000..9b21938
 --- /dev/null
 +++ b/src/graphics/vulkan/fast_resolve.cpp
-@@ -0,0 +1,717 @@
+@@ -0,0 +1,712 @@
 +/**
 + * [4deviltears] Fast resolves for the Vulkan render target cache.
 + *
@@ -10594,13 +10594,8 @@ index 0000000..0365ab3
 +    zc_count = g_4dt_resolve_texture_cache->Dmc4GetZeroCopyTargets(
 +        alias->address, dst_x + width, dst_y + height, fast_resolve_dest_layout_,
 +        fast_resolve_descriptor_pool_, zc_targets, 4);
-+    for (uint32_t i = 0; i < zc_count; ++i) {
-+      if (zc_targets[i].width != alias->consumed_width ||
-+          zc_targets[i].height != alias->consumed_height) {
-+        zc_count = 0;  // other consumers of the alias - keep the alias path
-+        break;
-+      }
-+    }
++    // Readers that aren't zero-copy textures are caught when they read the alias (zero-copy
++    // is then blocked for the address).
 +  }
 +  void* zero_copy_texture = zc_count ? zc_targets[0].texture : nullptr;
 +
@@ -11044,7 +11039,7 @@ index 91ac08f..ee976e5 100644
        }
      }
 diff --git a/src/graphics/vulkan/render_target_cache.cpp b/src/graphics/vulkan/render_target_cache.cpp
-index 0298f06..0c4a02d 100644
+index 0298f06..068e2e1 100644
 --- a/src/graphics/vulkan/render_target_cache.cpp
 +++ b/src/graphics/vulkan/render_target_cache.cpp
 @@ -10,6 +10,8 @@
@@ -11288,7 +11283,7 @@ index 0298f06..0c4a02d 100644
 +}
 +}  // namespace
 +
-+REXCVAR_DEFINE_BOOL(d3d_clear_hle_take_ownership, true, "GPU",
++REXCVAR_DEFINE_BOOL(d3d_clear_hle_take_ownership, false, "GPU",
 +                    "[4DevilTears] XDK clears over EDRAM of another format: the cleared render "
 +                    "target takes the rows over without transfers (false: the clear is drawn)");
 +
@@ -11899,7 +11894,7 @@ index 6788214..04b716d 100644
    DeferredCommandBuffer& command_buffer = command_processor_.deferred_command_buffer();
    uint64_t submission_current = command_processor_.GetCurrentSubmission();
 diff --git a/src/graphics/vulkan/texture_cache.cpp b/src/graphics/vulkan/texture_cache.cpp
-index ecbd940..8fc2952 100644
+index ecbd940..6439e38 100644
 --- a/src/graphics/vulkan/texture_cache.cpp
 +++ b/src/graphics/vulkan/texture_cache.cpp
 @@ -10,6 +10,8 @@
@@ -12222,7 +12217,7 @@ index ecbd940..8fc2952 100644
    VulkanTexture& vulkan_texture = static_cast<VulkanTexture&>(texture);
    TextureKey texture_key = vulkan_texture.key();
  
-@@ -1237,6 +1418,206 @@ bool VulkanTextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture,
+@@ -1237,6 +1418,202 @@ bool VulkanTextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture,
    if (pipeline == VK_NULL_HANDLE) {
      return false;
    }
@@ -12282,11 +12277,7 @@ index ecbd940..8fc2952 100644
 +                          uint32_t(texture_key.endianness) == alias->endian &&
 +                          (uint32_t(texture_key.pitch) << 5) == alias->width &&
 +                          width <= alias->width && height <= alias->height;
-+        auto zc_targets_it = g_4dt_zero_copy_by_address.find(texture_address);
-+        if (compatible && alias->zero_copy_last &&
-+            (zc_targets_it == g_4dt_zero_copy_by_address.end() ||
-+             std::find(zc_targets_it->second.begin(), zc_targets_it->second.end(),
-+                       &vulkan_texture) == zc_targets_it->second.end())) {
++        if (compatible && alias->zero_copy_last) {
 +          // The resolves go straight into another texture at this address - this one would
 +          // read a stale alias. Back to the alias for everyone (from the next resolve).
 +          Dmc4BlockZeroCopy(texture_address, "also read by another texture");
@@ -12429,7 +12420,7 @@ index ecbd940..8fc2952 100644
    const LoadShaderInfo& load_shader_info = GetLoadShaderInfo(load_shader);
    LoadShaderIndex load_shader_float_convert = kLoadShaderIndexUnknown;
    if (host_format.format == VK_FORMAT_R16G16B16A16_SFLOAT) {
-@@ -1741,6 +2122,57 @@ bool VulkanTextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture,
+@@ -1741,6 +2118,57 @@ bool VulkanTextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture,
          texture_dst_access_mask, texture_old_layout, texture_new_layout);
    }
    command_processor_.SubmitBarriers(true);
@@ -12487,7 +12478,7 @@ index ecbd940..8fc2952 100644
    VkBufferImageCopy* copy_regions = command_buffer.CmdCopyBufferToImageEmplace(
        scratch_buffer, vulkan_texture.image(), VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
        level_last - level_first + 1);
-@@ -1783,6 +2215,80 @@ bool VulkanTextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture,
+@@ -1783,6 +2211,80 @@ bool VulkanTextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture,
      copy_region.imageExtent.depth = std::max(depth >> level, UINT32_C(1));
    }
  
@@ -12568,7 +12559,7 @@ index ecbd940..8fc2952 100644
    return true;
  }
  
-@@ -1857,6 +2363,27 @@ VulkanTextureCache::VulkanTexture::~VulkanTexture() {
+@@ -1857,6 +2359,27 @@ VulkanTextureCache::VulkanTexture::~VulkanTexture() {
    if (image_view_3d_as_2d_signed_ != VK_NULL_HANDLE) {
      dfn.vkDestroyImageView(device, image_view_3d_as_2d_signed_, nullptr);
    }
@@ -12596,7 +12587,7 @@ index ecbd940..8fc2952 100644
    vmaDestroyImage(vulkan_texture_cache.vma_allocator_, image_, allocation_);
  }
  
-@@ -1908,6 +2435,15 @@ VkImageView VulkanTextureCache::VulkanTexture::GetView(bool is_signed, uint32_t
+@@ -1908,6 +2431,15 @@ VkImageView VulkanTextureCache::VulkanTexture::GetView(bool is_signed, uint32_t
    VkImageViewCreateInfo view_create_info;
    view_create_info.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
    view_create_info.pNext = nullptr;
@@ -12612,7 +12603,7 @@ index ecbd940..8fc2952 100644
    view_create_info.flags = 0;
    view_create_info.image = image();
    view_create_info.format = format;
-@@ -2937,6 +3473,40 @@ bool VulkanTextureCache::Initialize() {
+@@ -2937,6 +3469,40 @@ bool VulkanTextureCache::Initialize() {
            i);
        return false;
      }
@@ -12653,7 +12644,7 @@ index ecbd940..8fc2952 100644
      if (IsDrawResolutionScaled()) {
        const std::pair<const uint32_t*, size_t>& current_load_shader_code_scaled =
            load_shader_code_scaled[i];
-@@ -3258,4 +3828,131 @@ xenos::ClampMode VulkanTextureCache::NormalizeClampMode(xenos::ClampMode clamp_m
+@@ -3258,4 +3824,142 @@ xenos::ClampMode VulkanTextureCache::NormalizeClampMode(xenos::ClampMode clamp_m
    return clamp_mode;
  }
  
@@ -12682,8 +12673,19 @@ index ecbd940..8fc2952 100644
 +  for (const void* texture_ptr : by_address_it->second) {
 +    auto* texture = const_cast<VulkanTexture*>(static_cast<const VulkanTexture*>(texture_ptr));
 +    Dmc4ZeroCopyTexture& entry = g_4dt_zero_copy[texture];
++    // Textures not sampled for a while (left over from another scene) don't count - if one is
++    // used again, its stale read blocks zero-copy for the address.
++    if (texture->last_usage_submission_index() + 120 < command_processor_.GetCurrentSubmission()) {
++      continue;
++    }
 +    uint32_t width = texture->key().GetWidth(), height = texture->key().GetHeight();
 +    if (dst_x1 > width || dst_y1 > height) {
++      static std::unordered_set<uint32_t> logged;
++      if (logged.insert(address).second) {
++        REXGPU_INFO("Fast resolve: no zero-copy at {:08X} for now - a {}x{} texture format {} "
++                    "there can't hold {}x{}",
++                    address, width, height, uint32_t(texture->key().format), dst_x1, dst_y1);
++      }
 +      return 0;  // one of the readers can't hold it - the alias path for all
 +    }
 +    if (entry.set == VK_NULL_HANDLE) {
