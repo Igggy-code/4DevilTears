@@ -8123,7 +8123,7 @@ index 0000000..4812f2a
 +
 +}  // namespace rex::graphics::vulkan::bc_decode
 diff --git a/src/graphics/vulkan/command_processor.cpp b/src/graphics/vulkan/command_processor.cpp
-index 001f36b..6315222 100644
+index 001f36b..bcc1ca8 100644
 --- a/src/graphics/vulkan/command_processor.cpp
 +++ b/src/graphics/vulkan/command_processor.cpp
 @@ -9,7 +9,10 @@
@@ -8221,7 +8221,7 @@ index 001f36b..6315222 100644
 +                    "[4DevilTears] Pass-to-pass barrier also between draw passes on the same "
 +                    "attachments (not only around ownership transfer passes)")
 +    .lifecycle(rex::cvar::Lifecycle::kHotReload);
-+REXCVAR_DEFINE_BOOL(collapse_predicated_tiling, true, "GPU",
++REXCVAR_DEFINE_BOOL(collapse_predicated_tiling, false, "GPU",
 +                    "[4DevilTears] Experimental: render predicated tiling bands (the scene drawn "
 +                    "3 times, once per screen band) as one full-height pass - the first band is "
 +                    "drawn with the full scissor, the draws of the other bands are skipped and "
