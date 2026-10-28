@@ -8179,7 +8179,7 @@ index 0000000..4812f2a
 +
 +}  // namespace rex::graphics::vulkan::bc_decode
 diff --git a/src/graphics/vulkan/command_processor.cpp b/src/graphics/vulkan/command_processor.cpp
-index 001f36b..19e4b58 100644
+index 001f36b..76bcf4f 100644
 --- a/src/graphics/vulkan/command_processor.cpp
 +++ b/src/graphics/vulkan/command_processor.cpp
 @@ -9,7 +9,10 @@
@@ -8301,7 +8301,9 @@ index 001f36b..19e4b58 100644
 +                    "[4DevilTears] Log the draws of one frame per menu screen (UI layout capture)");
 +REXCVAR_DEFINE_STRING(ui_capture_file, "", "GPU",
 +                      "[4DevilTears] File for the UI layout capture (empty: the main log)");
-+extern "C" uint64_t Dmc4UiSignatureC() __attribute__((weak));
++// The host (game) registers its menu signature function: menu screen + cursor position.
++static std::atomic<uint64_t (*)()> g_4dt_ui_signature_fn{nullptr};
++extern "C" void Rex4dtSetUiSignatureFn(uint64_t (*fn)()) { g_4dt_ui_signature_fn.store(fn); }
 +namespace {
 +struct Dmc4UiDrawCapture {
 +  bool logging = false;
@@ -8358,16 +8360,18 @@ index 001f36b..19e4b58 100644
 +  uint64_t layout = 0;
 +  for (uint64_t item : c.frame_items) layout += item * 0x9E3779B97F4A7C15ull;
 +  c.layout_hash = layout;
-+  const uint64_t sig = Dmc4UiSignatureC ? Dmc4UiSignatureC() : 0;
-+  const uint64_t key = Dmc4Mix(sig, layout);
++  uint64_t (*sig_fn)() = g_4dt_ui_signature_fn.load();
++  const uint64_t sig = sig_fn ? sig_fn() : 0;
++  // A known menu: one frame per screen + cursor position. Otherwise the drawn set.
++  const uint64_t key = (sig & ~uint64_t(0xFF)) != 0 ? Dmc4Mix(sig, 1) : Dmc4Mix(sig, layout);
 +  const int64_t now = Dmc4UiNowMs();
 +  if (key != c.last_key) {
 +    c.last_key = key;
 +    c.key_since_ms = now;
 +  }
 +  const bool stable_new = now - c.key_since_ms >= 300 && !c.done.count(key);
-+  // Fallback: a frame every 4 s even if the key looks the same (animated screens).
-+  const bool periodic = now - c.last_log_ms >= 4000;
++  // Fallback: a frame every 2.5 s even if the key looks the same (animated screens).
++  const bool periodic = now - c.last_log_ms >= 2500;
 +  if ((stable_new || periodic) && now - c.last_log_ms >= 500 && c.done.size() < 1500) {
 +    c.logging = true;
 +    c.logging_key = key;
@@ -8461,75 +8465,71 @@ index 001f36b..19e4b58 100644
 +      auto word = [&](uint32_t index) -> uint32_t {
 +        return index < size_words ? xenos::GpuSwap(vb[index], endian) : 0;
 +      };
-+      // Vertex range used by the draw.
++      // Vertices used by the draw, in index order; kRestart separates the strips (primitive
++      // reset) - with triangle strips one strip is usually one sprite.
++      constexpr uint32_t kRestart = UINT32_MAX;
 +      const uint32_t indx_offset = regs[XE_GPU_REG_VGT_INDX_OFFSET] & 0xFFFFFF;
-+      uint32_t vmin = 0, vmax = index_count ? index_count - 1 : 0;
-+      std::string idx_line;
++      std::vector<uint32_t> used;
++      const uint32_t n = std::min(index_count, 4096u);
++      used.reserve(n);
 +      if (ib) {
-+        vmin = UINT32_MAX;
-+        vmax = 0;
-+        const uint32_t n = std::min(index_count, 4096u);
-+        if (ib_format == xenos::IndexFormat::kInt32) {
-+          const uint32_t* id = memory->TranslatePhysical<const uint32_t*>(ib_base);
-+          for (uint32_t i = 0; i < n; ++i) {
-+            uint32_t v = xenos::GpuSwap(id[i], ib_endian);
-+            vmin = std::min(vmin, v);
-+            vmax = std::max(vmax, v);
++        for (uint32_t i = 0; i < n; ++i) {
++          uint32_t v;
++          if (ib_format == xenos::IndexFormat::kInt32) {
++            v = xenos::GpuSwap(memory->TranslatePhysical<const uint32_t*>(ib_base)[i], ib_endian);
++            if (v == 0xFFFFFFFFu) v = kRestart;
++          } else {
++            v = xenos::GpuSwap(memory->TranslatePhysical<const uint16_t*>(ib_base)[i], ib_endian);
++            if (v == 0xFFFFu) v = kRestart;
 +          }
-+        } else {
-+          const uint16_t* id = memory->TranslatePhysical<const uint16_t*>(ib_base);
-+          for (uint32_t i = 0; i < n; ++i) {
-+            uint32_t v = xenos::GpuSwap(id[i], ib_endian);
-+            vmin = std::min(vmin, v);
-+            vmax = std::max(vmax, v);
-+          }
++          used.push_back(v == kRestart ? kRestart : ((v + indx_offset) & 0xFFFFFF));
 +        }
-+        if (vmin > vmax) vmin = vmax = 0;
-+        // The indices too (how the vertices form quads), up to 768.
-+        idx_line = " idx";
-+        const uint32_t ni = std::min(index_count, 768u);
-+        for (uint32_t i = 0; i < ni; ++i) {
-+          uint32_t v = ib_format == xenos::IndexFormat::kInt32
-+                           ? xenos::GpuSwap(memory->TranslatePhysical<const uint32_t*>(ib_base)[i], ib_endian)
-+                           : xenos::GpuSwap(memory->TranslatePhysical<const uint16_t*>(ib_base)[i], ib_endian);
-+          idx_line += fmt::format(" {}", v);
++      } else {
++        for (uint32_t i = 0; i < n; ++i) used.push_back(i + indx_offset);
++      }
++      uint32_t first_vertex = kRestart;
++      for (uint32_t v : used) {
++        if (v != kRestart) {
++          first_vertex = v;
++          break;
 +        }
 +      }
-+      vmin += indx_offset;
-+      vmax += indx_offset;
-+      line += fmt::format(" v{}-{}", vmin, vmax);
-+      line += idx_line;
 +      const bool pos_float = pos_format == xenos::VertexFormat::k_32_32_FLOAT ||
 +                             pos_format == xenos::VertexFormat::k_32_32_32_FLOAT ||
 +                             pos_format == xenos::VertexFormat::k_32_32_32_32_FLOAT;
-+      if (vb && stride && pos_offset >= 0 && pos_float) {
-+        float x0 = 1e30f, y0 = 1e30f, x1 = -1e30f, y1 = -1e30f;
-+        const uint32_t last = std::min(vmax, vmin + 4095);
-+        for (uint32_t v = vmin; v <= last; ++v) {
++      if (vb && stride && pos_offset >= 0 && pos_float && first_vertex != kRestart) {
++        auto pos = [&](uint32_t v, float& x, float& y) {
 +          uint32_t wx = word(v * stride + pos_offset), wy = word(v * stride + pos_offset + 1);
-+          float x, y;
 +          std::memcpy(&x, &wx, 4);
 +          std::memcpy(&y, &wy, 4);
++        };
++        float x0 = 1e30f, y0 = 1e30f, x1 = -1e30f, y1 = -1e30f;
++        for (uint32_t v : used) {
++          if (v == kRestart) continue;
++          float x, y;
++          pos(v, x, y);
 +          x0 = std::min(x0, x);
 +          y0 = std::min(y0, y);
 +          x1 = std::max(x1, x);
 +          y1 = std::max(y1, y);
 +        }
 +        line += fmt::format(" bb {:g},{:g} {:g},{:g}", x0, y0, x1, y1);
-+        // Every vertex position (sprites batched in one draw - text, list rows, arrows -
-+        // are told apart offline by grouping the vertices into quads).
-+        if (last > vmin) {
++        // Every used vertex position, strips separated by "/" (big 3D draws skipped).
++        if (index_count <= 2048) {
 +          line += " xy";
-+          const uint32_t vlast = std::min(last, vmin + 511);
-+          for (uint32_t v = vmin; v <= vlast; ++v) {
-+            uint32_t wx = word(v * stride + pos_offset), wy = word(v * stride + pos_offset + 1);
++          for (uint32_t v : used) {
++            if (v == kRestart) {
++              line += " /";
++              continue;
++            }
 +            float x, y;
-+            std::memcpy(&x, &wx, 4);
-+            std::memcpy(&y, &wy, 4);
++            pos(v, x, y);
 +            line += fmt::format(" {:.1f},{:.1f}", x, y);
 +          }
 +        }
 +      }
++      const uint32_t vmin = first_vertex == kRestart ? 0 : first_vertex;
++      const uint32_t vmax = vmin + 3;
 +      if (vb && stride) {
 +        line += " raw";
 +        const uint32_t count = std::min<uint32_t>(vmax - vmin + 1, 4);
