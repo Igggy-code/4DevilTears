@@ -430,3 +430,10 @@ size = 0x20
 size = 0x20
 [entrypoint.functions."0x828798F0"]
 size = 0x20
+
+# --- Widescreen (host/src/dmc4_widescreen.cpp) ---
+# sub_8245B028: camera->mAspect = viewport w/h (stfs f0,32(r30)); scaled for screens wider than 16:9.
+[[entrypoint.midasm_hook]]
+address = 0x8245B254
+name = "Dmc4WideAspect"
+registers = ["f0", "r30", "r31"]

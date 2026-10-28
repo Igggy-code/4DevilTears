@@ -9,7 +9,7 @@ include(generated/rexglue.cmake)
 set(DMC4_SOURCES src/main.cpp)
 if(ANDROID)
     # SDLActivity loads libdmc4.so and calls its SDL_main.
-    add_library(dmc4 SHARED ${DMC4_SOURCES} src/android_touch_gamepad.cpp src/dmc4_menu_hooks.cpp)
+    add_library(dmc4 SHARED ${DMC4_SOURCES} src/android_touch_gamepad.cpp src/dmc4_menu_hooks.cpp src/dmc4_widescreen.cpp src/dmc4_boot.cpp src/dmc4_perf.cpp src/dmc4_d3dtrace.cpp)
     target_link_libraries(dmc4 PRIVATE log android)
     target_link_options(dmc4 PRIVATE -Wl,-z,max-page-size=16384)
     # Codegen runs on the build machine: use the host (macOS) rexglue tool
