@@ -13822,10 +13822,10 @@ index 23645ef..de750e6 100644
    submit_info.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
    submit_info.pNext = nullptr;
 diff --git a/src/ui/window_sdl.cpp b/src/ui/window_sdl.cpp
-index 2251429..c842eb6 100644
+index 2251429..579a851 100644
 --- a/src/ui/window_sdl.cpp
 +++ b/src/ui/window_sdl.cpp
-@@ -35,6 +35,8 @@
+@@ -35,11 +35,27 @@
  #include <SDL3/SDL_metal.h>
  
  #include <rex/ui/surface_mac.h>
@@ -13834,7 +13834,26 @@ index 2251429..c842eb6 100644
  #else
  #include <X11/Xlib-xcb.h>
  #include <rex/ui/surface_gnulinux.h>
-@@ -398,6 +400,15 @@ std::unique_ptr<Surface> WindowSDL::CreateSurfaceImpl(Surface::TypeFlags allowed
+ #endif
+ 
++#if REX_PLATFORM_ANDROID
++#include <atomic>
++// [4DevilTears] Android surface lifecycle. The app (Java) reports when SDL's SurfaceView surface
++// is created / destroyed (the window property keeps a released ANativeWindow after
++// surfaceDestroyed), the presenter is detached when the app goes to the background and attached
++// to the new surface when it comes back.
++std::atomic<bool> g_rex_android_surface_alive{true};
++std::atomic<uint32_t> g_rex_android_surface_generation{0};
++namespace {
++bool g_rex_android_detached = false;
++uint32_t g_rex_android_attached_generation = 0;
++}  // namespace
++#endif
++
+ namespace rex::ui {
+ 
+ namespace {
+@@ -398,6 +414,15 @@ std::unique_ptr<Surface> WindowSDL::CreateSurfaceImpl(Surface::TypeFlags allowed
        SDL_Metal_DestroyView(metal_view);
      }
    }
@@ -13850,6 +13869,93 @@ index 2251429..c842eb6 100644
  #else
    SDL_PropertiesID props = SDL_GetWindowProperties(sdl_window_);
    if (allowed_types & Surface::kTypeFlag_WaylandSurface) {
+@@ -436,12 +461,43 @@ void WindowSDL::RequestPaintImpl() {
+ 
+ void WindowSDL::HandlePaintEvent() {
+   paint_pending_.store(false, std::memory_order_release);
++#if REX_PLATFORM_ANDROID
++  {
++    // Back from the background (or the surface was recreated): attach to the new surface.
++    uint32_t generation = g_rex_android_surface_generation.load();
++    if (phase() == Phase::kOpen && g_rex_android_surface_alive.load() &&
++        (g_rex_android_detached || !HasSurface() ||
++         generation != g_rex_android_attached_generation) &&
++        SDL_GetPointerProperty(SDL_GetWindowProperties(sdl_window_),
++                               SDL_PROP_WINDOW_ANDROID_WINDOW_POINTER, nullptr)) {
++      g_rex_android_detached = false;
++      g_rex_android_attached_generation = generation;
++      REXLOG_INFO("Android: attaching to the surface (generation {})", generation);
++      OnSurfaceChanged(true);
++    }
++  }
++#endif
+   OnPaint();
+ }
+ 
+ void WindowSDL::HandleWindowEvent(SDL_Event& event) {
+   WindowDestructionReceiver destruction_receiver(this);
+   switch (event.type) {
++#if REX_PLATFORM_ANDROID
++    case SDL_EVENT_WILL_ENTER_BACKGROUND:
++    case SDL_EVENT_DID_ENTER_BACKGROUND:
++      // Stop presenting before Android destroys the surface.
++      if (HasSurface()) {
++        REXLOG_INFO("Android: background - detaching from the surface");
++        OnSurfaceChanged(false);
++      }
++      g_rex_android_detached = true;
++      break;
++    case SDL_EVENT_DID_ENTER_FOREGROUND:
++      HandlePaintEvent();
++      RequestPaint();
++      break;
++#endif
+     case SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED:
+       OnActualSizeUpdate(uint32_t(event.window.data1), uint32_t(event.window.data2),
+                          destruction_receiver);
+diff --git a/src/ui/windowed_app_context_sdl.cpp b/src/ui/windowed_app_context_sdl.cpp
+index dc0b4c2..5c855f0 100644
+--- a/src/ui/windowed_app_context_sdl.cpp
++++ b/src/ui/windowed_app_context_sdl.cpp
+@@ -169,6 +169,17 @@ void SDLWindowedAppContext::ProcessEvent(SDL_Event& event) {
+       }
+       break;
+     }
++#if REX_PLATFORM_ANDROID
++    case SDL_EVENT_DID_ENTER_FOREGROUND: {
++      for (const auto& [id, window] : windows_) {
++        (void)window;
++        if (WindowSDL* w = GetWindow(id)) {
++          w->HandleWindowEvent(event);
++        }
++      }
++      break;
++    }
++#endif
+     case SDL_EVENT_DROP_FILE: {
+       if (WindowSDL* window = GetWindow(event.drop.windowID)) {
+         window->HandleDropEvent(event);
+@@ -182,6 +193,20 @@ void SDLWindowedAppContext::ProcessEvent(SDL_Event& event) {
+ 
+ bool SDLCALL SDLWindowedAppContext::WatchEvent(void* userdata, SDL_Event* event) {
+   auto* context = static_cast<SDLWindowedAppContext*>(userdata);
++#if REX_PLATFORM_ANDROID
++  // [4DevilTears] Sent from the main thread right before SDL blocks it for the pause - detach
++  // the presenters now, while the surface still exists.
++  if ((event->type == SDL_EVENT_WILL_ENTER_BACKGROUND ||
++       event->type == SDL_EVENT_DID_ENTER_BACKGROUND) &&
++      SDL_IsMainThread() && context->IsInUIThread()) {
++    for (const auto& [id, window] : context->windows_) {
++      (void)window;
++      if (WindowSDL* w = context->GetWindow(id)) {
++        w->HandleWindowEvent(*event);
++      }
++    }
++  }
++#endif
+   if (event->type == SDL_EVENT_QUIT && SDL_IsMainThread() && context->IsInUIThread()) {
+     // Cocoa stops making Metal drawables available as part of its termination
+     // request. Handle the request synchronously while SDL is queueing it,
 diff --git a/src/ui/windowed_app_main_sdl.cpp b/src/ui/windowed_app_main_sdl.cpp
 index 77bb1dc..c62d257 100644
 --- a/src/ui/windowed_app_main_sdl.cpp
