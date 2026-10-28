@@ -1092,10 +1092,10 @@ index 0c39a42..d97adfb 100644
    // System memory is kept separate from game memory but is still accessible
    // using normal guest virtual addresses. Kernel structures and other internal
 diff --git a/include/rex/thread.h b/include/rex/thread.h
-index 30b207d..f507a73 100644
+index 30b207d..6dd4265 100644
 --- a/include/rex/thread.h
 +++ b/include/rex/thread.h
-@@ -108,6 +108,19 @@ void set_current_thread_name(const std::string_view name);
+@@ -108,6 +108,21 @@ void set_current_thread_name(const std::string_view name);
  // Yields the current thread to the scheduler. Maybe.
  void MaybeYield();
  
@@ -1105,6 +1105,8 @@ index 30b207d..f507a73 100644
 +// deferred until it leaves host code, like the Xbox kernel defers it to the end of a call.
 +__attribute__((visibility("default"))) void EnterHostCode();
 +__attribute__((visibility("default"))) void LeaveHostCode();
++// [4DevilTears] Host tid of the thread owning the global critical region (0: free or unknown).
++__attribute__((visibility("default"))) int GlobalLockOwnerTid();
 +struct HostCodeScope {
 +  HostCodeScope() { EnterHostCode(); }
 +  ~HostCodeScope() { LeaveHostCode(); }
@@ -1376,12 +1378,13 @@ index 7a711a8..d2eec33 100644
    assert_true(clients_[index].driver != NULL);
 diff --git a/src/audio/dmc4_recorder.cpp b/src/audio/dmc4_recorder.cpp
 new file mode 100644
-index 0000000..e0bb9a7
+index 0000000..55964ef
 --- /dev/null
 +++ b/src/audio/dmc4_recorder.cpp
-@@ -0,0 +1,397 @@
+@@ -0,0 +1,428 @@
 +// [4DevilTears] Debug recorder - see rex/audio/dmc4_recorder.h.
 +#include <rex/audio/dmc4_recorder.h>
++#include <rex/thread.h>
 +
 +#include <atomic>
 +#include <chrono>
@@ -1541,6 +1544,14 @@ index 0000000..e0bb9a7
 +
 +std::string Symbolize(uintptr_t addr) {
 +  if (!addr) return "-";
++#if defined(__aarch64__)
++  {
++    // Return addresses signed with pointer authentication: strip the signature.
++    register uintptr_t lr asm("x30") = addr;
++    asm volatile("hint #7" : "+r"(lr));  // xpaclri
++    addr = lr;
++  }
++#endif
 +  Dl_info info = {};
 +  if (dladdr(reinterpret_cast<void*>(addr), &info) && info.dli_sname) {
 +    return fmt::format("{}+{:X}", info.dli_sname, addr - uintptr_t(info.dli_saddr));
@@ -1569,6 +1580,7 @@ index 0000000..e0bb9a7
 +    const int64_t since = s.since_us.load();
 +    if (since && now - since > 800000) waiting[s.host_tid.load()] = true;
 +  }
++  waiting.erase(rex::thread::GlobalLockOwnerTid());
 +  std::vector<int> tids;
 +  if (DIR* dir = opendir("/proc/self/task")) {
 +    while (dirent* ent = readdir(dir)) {
@@ -1648,6 +1660,23 @@ index 0000000..e0bb9a7
 +            s.kind.load() ? s.kind.load() : "?", s.object.load(), s.type.load(), s.count.load(),
 +            (now - since) / 1000, s.infinite.load() ? " infinite" : ""));
 +      }
++      {
++        // Who holds the global critical region (logged when held across two ticks).
++        static int last_owner = 0;
++        const int owner = rex::thread::GlobalLockOwnerTid();
++        if (owner && owner == last_owner) {
++          std::string who = fmt::format("host{}", owner);
++          for (int i = 0; i < n; ++i) {
++            if (g_slots[i].used && g_slots[i].host_tid.load() == owner) {
++              PPCContext* c = g_slots[i].ctx.load();
++              who = fmt::format("t{:X} lr {:08X}", g_slots[i].thread_id.load(),
++                                c ? uint32_t(c->lr) : 0u);
++            }
++          }
++          lines.push_back(fmt::format("GLOCK held by {}", who));
++        }
++        last_owner = owner;
++      }
 +      if (all) lines.push_back(threads);
 +    }
 +#if DMC4REC_SAMPLER
@@ -1722,6 +1751,10 @@ index 0000000..e0bb9a7
 +  PPCContext* ctx = s->ctx.load();
 +  s->lr = ctx ? uint32_t(ctx->lr) : 0u;
 +  s->since_us = NowUs();
++  if (On() && rex::thread::GlobalLockOwnerTid() == int(syscall(SYS_gettid))) {
++    Line(fmt::format("WAIT-GLOCK t{:X} lr {:08X} {} obj {:08X}", s->thread_id.load(), s->lr.load(),
++                     kind, object));
++  }
 +  active_ = true;
 +  slot_ = reinterpret_cast<uint64_t>(s);
 +}
@@ -2334,7 +2367,7 @@ index b52bf39..2cdcd55 100644
  
  namespace rex {
 diff --git a/src/core/threading_posix.cpp b/src/core/threading_posix.cpp
-index 9ac8d15..b53e106 100644
+index 9ac8d15..9734567 100644
 --- a/src/core/threading_posix.cpp
 +++ b/src/core/threading_posix.cpp
 @@ -8,6 +8,7 @@
@@ -2510,7 +2543,7 @@ index 9ac8d15..b53e106 100644
      }
      if (is_current_thread) {
        pthread_exit(reinterpret_cast<void*>(exit_code));
-@@ -1398,6 +1451,46 @@ class PosixThread : public PosixConditionHandle<Thread> {
+@@ -1398,6 +1451,53 @@ class PosixThread : public PosixConditionHandle<Thread> {
  
  thread_local PosixThread* current_thread_ = nullptr;
  
@@ -2524,11 +2557,18 @@ index 9ac8d15..b53e106 100644
 +// held and every other thread (memory, GPU, audio, waits) piled up behind it.
 +// Bionic keeps the owner's tid in recursive mutexes (pthread_mutex_internal_t:
 +// state u16, pad u16, owner_tid int); a read from the signal handler is safe.
-+static bool OwnsGlobalLock() {
++int GlobalLockOwnerTid() {
 +#if REX_PLATFORM_ANDROID
 +  auto* m = global_critical_region::mutex().native_handle();
-+  const auto* words = reinterpret_cast<const volatile int32_t*>(m);
-+  return words[1] == static_cast<int32_t>(gettid());
++  return reinterpret_cast<const volatile int32_t*>(m)[1];
++#else
++  return 0;
++#endif
++}
++
++static bool OwnsGlobalLock() {
++#if REX_PLATFORM_ANDROID
++  return GlobalLockOwnerTid() == static_cast<int32_t>(gettid());
 +#else
 +  return false;
 +#endif
@@ -2557,7 +2597,7 @@ index 9ac8d15..b53e106 100644
  void* PosixCondition<Thread>::ThreadStartRoutine(void* parameter) {
  #if !REX_PLATFORM_ANDROID
    if (pthread_setcanceltype(PTHREAD_CANCEL_ASYNCHRONOUS, nullptr) != 0) {
-@@ -1449,6 +1542,7 @@ void* PosixCondition<Thread>::ThreadStartRoutine(void* parameter) {
+@@ -1449,6 +1549,7 @@ void* PosixCondition<Thread>::ThreadStartRoutine(void* parameter) {
      thread->handle_.exit_code_ = 0;
      thread->handle_.signaled_ = true;
      thread->handle_.cond_.notify_all();
@@ -2565,7 +2605,7 @@ index 9ac8d15..b53e106 100644
    }
  
    current_thread_ = nullptr;
-@@ -1527,6 +1621,11 @@ static void signal_handler(int signal, siginfo_t* /*info*/, void* /*context*/) {
+@@ -1527,6 +1628,11 @@ static void signal_handler(int signal, siginfo_t* /*info*/, void* /*context*/) {
        if (!current_thread_) {
          return;
        }
@@ -2578,15 +2618,16 @@ index 9ac8d15..b53e106 100644
      } break;
      case SignalType::kThreadUserCallback: {
 diff --git a/src/core/threading_win.cpp b/src/core/threading_win.cpp
-index 896dfec..19d876f 100644
+index 896dfec..fcd2d72 100644
 --- a/src/core/threading_win.cpp
 +++ b/src/core/threading_win.cpp
-@@ -84,6 +84,9 @@ void set_current_thread_name(const std::string_view name) {
+@@ -84,6 +84,10 @@ void set_current_thread_name(const std::string_view name) {
    set_thread_name_impl(GetCurrentThread(), name);
  }
  
 +void EnterHostCode() {}
 +void LeaveHostCode() {}
++int GlobalLockOwnerTid() { return 0; }
 +
  void MaybeYield() {
    SwitchToThread();
