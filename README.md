@@ -11,6 +11,7 @@
   <img alt="Arch" src="https://img.shields.io/badge/arch-arm64--v8a-555">
   <img alt="Graphics" src="https://img.shields.io/badge/graphics-Vulkan%201.1-AC162C?logo=vulkan&logoColor=white">
   <img alt="GPUs" src="https://img.shields.io/badge/GPU-Mali%20%C2%B7%20Adreno-0b5fa5">
+  <img alt="Version" src="https://img.shields.io/badge/version-0.7-6a1b9a">
   <img alt="Status" src="https://img.shields.io/badge/status-in%20development-orange">
 </p>
 
@@ -37,8 +38,8 @@ of the game into a ready-to-play installation.
 | 📀 **Bring your own game** | First launch asks for the game: a disc image (`.iso`: plain XISO or a full Redump XGD1/2/3 dump) or a *Games on Demand* folder. The layout is detected automatically and the game is unpacked once into the app (~6.5 GB). |
 | 🌍 **Editions** | The original release and the Russian fan translation (same executable, translated text and voices). |
 | 🎮 **Controls** | On-screen Xbox 360 controller with opacity, fade-when-idle and *essential buttons only* modes. Bluetooth / USB gamepads work out of the box. |
-| 🎬 **Cinema mode** | No controls over cutscenes and movies — tap once, tap again to skip. The controller only shows up in gameplay. |
-| 👆 **Touch menus** | Tap a menu item to select it, tap again to confirm: title menu, mission screen, mission select, pause. Swipes and two-finger *back* everywhere else. |
+| 🎬 **Cinema mode** | On by default. No controls over logos, movies, cutscenes, loading screens and menus — tap once, tap again to skip a cutscene. The controller only shows up in gameplay. |
+| 👆 **Touch menus** | Menus are recognised from what the game draws, so taps follow the game's own layout on every screen: tap a list item to select it, tap again to confirm; arrows and values change at once; save slots; the button prompts at the bottom work as those buttons. Swipes and two-finger *back* still work everywhere. |
 | ✨ **TAP to START** | The title screen asks you to *tap*, not to press a button — rebuilt on the device from the game's own lettering. |
 | 🖼️ **Display** | Original 16:9, fill or stretch; optional 30 FPS lock for steadier frame pacing; FPS counter. |
 | 🔊 **Audio** | 5.1 soundtracks folded to stereo on the device, so dialogue (center channel) is never lost on phone speakers. |
