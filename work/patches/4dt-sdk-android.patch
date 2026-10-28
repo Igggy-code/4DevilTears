@@ -1747,6 +1747,59 @@ index 0d8f8af..775bb46 100644
 +        glslang::SPIRV GPUOpen::VulkanMemoryAllocator glslang MachineIndependent GenericCodeGen
 +        OSDependent OGLCompiler)
 +endif()
+diff --git a/src/graphics/command_processor.cpp b/src/graphics/command_processor.cpp
+index a744375..4e3f750 100644
+--- a/src/graphics/command_processor.cpp
++++ b/src/graphics/command_processor.cpp
+@@ -10,6 +10,8 @@
+  */
+ 
+ #include <algorithm>
++#include <chrono>
++#include <thread>
+ #include <cinttypes>
+ #include <cmath>
+ #include <cstring>
+@@ -36,6 +38,14 @@
+ #include <rex/system/user_module.h>
+ 
+ REXCVAR_DEFINE_BOOL(vsync, true, "GPU", "Enable vertical sync");
++REXCVAR_DEFINE_INT32(gpu_wait_sleep_us, 100, "GPU",
++                     "[4DevilTears] WAIT_REG_MEM polling sleep in microseconds (0 = the original "
++                     "whole-millisecond sleeps)")
++    .lifecycle(rex::cvar::Lifecycle::kHotReload);
++namespace {
++uint64_t g_4dt_wait_polls = 0;
++uint64_t g_4dt_wait_us = 0;
++}  // namespace
+ 
+ REXCVAR_DEFINE_BOOL(clear_memory_page_state, true, "GPU",
+                     "Refresh page-valid state from GPU-written memory at frame end. "
+@@ -1036,8 +1046,24 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
+         if (!REXCVAR_GET(vsync)) {
+           // User wants it fast and dangerous.
+           rex::thread::MaybeYield();
++        } else if (REXCVAR_GET(gpu_wait_sleep_us) > 0) {
++          // [4DevilTears] Poll in short sleeps instead of whole milliseconds: the GPU (and the
++          // game waiting on it) resumes up to ~1 ms sooner after the awaited value appears.
++          auto t0 = std::chrono::steady_clock::now();
++          std::this_thread::sleep_for(std::chrono::microseconds(REXCVAR_GET(gpu_wait_sleep_us)));
++          g_4dt_wait_us += uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(
++                                        std::chrono::steady_clock::now() - t0)
++                                        .count());
+         } else {
++          auto t0 = std::chrono::steady_clock::now();
+           rex::thread::Sleep(std::chrono::milliseconds(wait / 0x100));
++          g_4dt_wait_us += uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(
++                                        std::chrono::steady_clock::now() - t0)
++                                        .count());
++        }
++        if (++g_4dt_wait_polls % 2000 == 0) {
++          REXGPU_INFO("GPUWAIT: {} polls, {} ms asleep in WAIT_REG_MEM so far", g_4dt_wait_polls,
++                      g_4dt_wait_us / 1000);
+         }
+         rex::thread::SyncMemory();
+         ReturnFromWait();
 diff --git a/src/graphics/flags.cpp b/src/graphics/flags.cpp
 index e2983a4..5df6034 100644
 --- a/src/graphics/flags.cpp
