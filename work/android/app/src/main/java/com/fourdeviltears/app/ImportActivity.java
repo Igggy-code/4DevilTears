@@ -57,7 +57,22 @@ public class ImportActivity extends Activity {
     private final Handler ui = new Handler(Looper.getMainLooper());
     private volatile boolean busy = false;
 
-    static File gameDir(android.content.Context c) { return new File(c.getFilesDir(), "game"); }
+    /**
+     * Where the unpacked game lives: the app's internal storage, or the app's own folder on a
+     * memory card (Android/data/com.fourdeviltears.app/files on the card). Both are private to
+     * the app and removed with it. Only the game files may go to a card: the game code built
+     * on the phone always stays internal (Android does not load code from a card).
+     */
+    static File gameDir(android.content.Context c) {
+        String p = GameBuild.readText(new File(c.getFilesDir(), LOCATION_FILE));
+        if (!p.isEmpty()) {
+            File f = new File(p);
+            if (f.isDirectory()) return f;   // card missing -> "not installed" -> import screen
+        }
+        return new File(c.getFilesDir(), "game");
+    }
+
+    private static final String LOCATION_FILE = "game_location.txt";
 
     static boolean gameInstalled(android.content.Context c) {
         File g = gameDir(c);
@@ -86,7 +101,8 @@ public class ImportActivity extends Activity {
             System.exit(0);
             return;
         }
-        startActivity(new Intent(this, DevilActivity.class));
+        // The game code is built on the phone once (and after app updates): BuildActivity.
+        startActivity(new Intent(this, GameBuild.ready(this) ? DevilActivity.class : BuildActivity.class));
         finish();
     }
 
@@ -393,13 +409,11 @@ public class ImportActivity extends Activity {
                         + sha.substring(0, 16) + ")");
             }
 
-            long free = new StatFs(getFilesDir().getPath()).getAvailableBytes();
-            File game = gameDir(this), tmp = new File(getFilesDir(), "game.importing");
-            if (free < total + 256L * 1024 * 1024) {
-                throw new IOException(String.format(Locale.US,
-                        "Not enough free space: %.1f GB needed, %.1f GB free.",
-                        total / 1e9, free / 1e9));
-            }
+            File root = chooseStorage(uri, tree, total + 256L * 1024 * 1024);
+            File old = gameDir(this);
+            File game = new File(root, "game"), tmp = new File(root, "game.importing");
+            Log.i(TAG, "game -> " + game);
+            final String where = root.equals(getFilesDir()) ? "Unpacking the game..." : "Unpacking the game to the memory card...";
             deleteTree(tmp);
             if (!tmp.mkdirs()) throw new IOException("Can't create " + tmp);
 
@@ -425,7 +439,7 @@ public class ImportActivity extends Activity {
                             double mbs = doneBytes / 1e6 / Math.max(0.001, (now - t0) / 1000.0);
                             final String d = String.format(Locale.US, "%.1f / %.1f GB  ·  %.0f MB/s\n%s",
                                     doneBytes / 1e9, total / 1e9, mbs, e.path);
-                            ui.post(() -> { progress.setProgress(p); status.setText("Unpacking the game..."); detail.setText(d); });
+                            ui.post(() -> { progress.setProgress(p); status.setText(where); detail.setText(d); });
                         }
                     }
                 }
@@ -433,7 +447,65 @@ public class ImportActivity extends Activity {
             }
             deleteTree(game);
             if (!tmp.renameTo(game)) throw new IOException("Can't move the unpacked game into place");
+            GameBuild.writeText(new File(getFilesDir(), LOCATION_FILE), game.getAbsolutePath());
+            if (!old.getAbsolutePath().equals(game.getAbsolutePath())) deleteTree(old);
             setStatus("Done", n + " files");
+        }
+    }
+
+    /**
+     * Picks the storage for the unpacked game, the way games with big downloads do it:
+     *  - the game was picked on a memory card -> the app's folder on that card (the player
+     *    keeps big files there), if it has room;
+     *  - otherwise internal storage, if it has room;
+     *  - otherwise any memory card with room.
+     */
+    private File chooseStorage(Uri uri, boolean tree, long needed) throws IOException {
+        File internal = getFilesDir();
+        long internalFree = new StatFs(internal.getPath()).getAvailableBytes();
+        List<File> cards = new ArrayList<>();
+        File[] ext = getExternalFilesDirs(null);
+        if (ext != null) {
+            for (File d : ext) {
+                if (d == null) continue;
+                try {
+                    if (!android.os.Environment.isExternalStorageRemovable(d)) continue;
+                    if (!android.os.Environment.MEDIA_MOUNTED.equals(android.os.Environment.getExternalStorageState(d))) continue;
+                } catch (IllegalArgumentException e) {
+                    continue;
+                }
+                d.mkdirs();
+                cards.add(d);
+            }
+        }
+        String vol = sourceVolume(uri, tree);   // "primary", a card id like "1A2B-3C4D", or null
+        Log.i(TAG, "source volume " + vol + ", internal free " + internalFree / 1000000 + " MB, cards " + cards);
+        if (vol != null && !"primary".equalsIgnoreCase(vol)) {
+            for (File c : cards) {
+                if (c.getAbsolutePath().contains("/" + vol + "/") && free(c) >= needed) return c;
+            }
+        }
+        if (internalFree >= needed) return internal;
+        for (File c : cards) if (free(c) >= needed) return c;
+        long best = internalFree;
+        for (File c : cards) best = Math.max(best, free(c));
+        throw new IOException(String.format(Locale.US,
+                "Not enough free space: %.1f GB needed, %.1f GB free.", needed / 1e9, best / 1e9));
+    }
+
+    private static long free(File d) {
+        try { return new StatFs(d.getPath()).getAvailableBytes(); } catch (Exception e) { return 0; }
+    }
+
+    /** Storage volume of a picked file/folder (system file picker ids look like "1A2B-3C4D:Games/dmc4"). */
+    private static String sourceVolume(Uri uri, boolean tree) {
+        try {
+            if (!"com.android.externalstorage.documents".equals(uri.getAuthority())) return null;
+            String id = tree ? DocumentsContract.getTreeDocumentId(uri) : DocumentsContract.getDocumentId(uri);
+            int colon = id.indexOf(':');
+            return colon > 0 ? id.substring(0, colon) : null;
+        } catch (Exception e) {
+            return null;
         }
     }
 

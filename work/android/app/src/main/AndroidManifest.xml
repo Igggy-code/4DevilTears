@@ -11,6 +11,12 @@
     <uses-feature android:name="android.hardware.usb.host" android:required="false" />
     <uses-feature android:name="android.hardware.type.pc" android:required="false" />
     <uses-permission android:name="android.permission.VIBRATE" />
+    <!-- On-device build of the game code: runs as a foreground service with a progress
+         notification and keeps going with the screen off. -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
 
     <application android:label="@string/app_name"
         android:icon="@mipmap/ic_launcher"
@@ -46,5 +52,16 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
+        <!-- One-time "Preparing the game": the game code is compiled on the phone. -->
+        <activity android:name="com.fourdeviltears.app.BuildActivity"
+            android:screenOrientation="sensorLandscape"
+            android:label="@string/app_name"
+            android:theme="@style/AppTheme"
+            android:launchMode="singleTop"
+            android:configChanges="orientation|screenSize|screenLayout|keyboardHidden"
+            android:exported="false" />
+        <service android:name="com.fourdeviltears.app.GameBuild"
+            android:foregroundServiceType="dataSync"
+            android:exported="false" />
     </application>
 </manifest>

@@ -18,6 +18,11 @@ exec > >(tee "$WORK/logs/android_build.log") 2>&1
 step() { echo; echo "=== [$(date +%H:%M:%S)] $* ==="; }
 fail() { echo; echo "!!! ОШИБКА: $*"; echo "!!! Лог: work/logs/android_build.log"; exit 1; }
 
+FREE_KB="$(df -k "$ROOT" | tail -1 | awk '{print $4}')"
+if [ "${FREE_KB:-0}" -lt 3000000 ]; then
+  echo "!!! на диске $((FREE_KB / 1024)) МБ свободно - сборке нужно ~3 ГБ."
+  echo "!!! Старые логи чистит install_android.sh (оставляет LOGS_KEEP последних прогонов)."
+fi
 step "Android SDK / NDK / JDK"
 find_sdk() {
   for c in "${ANDROID_HOME:-}" "${ANDROID_SDK_ROOT:-}" "$HOME/Library/Android/sdk" /Volumes/T7/AndroidSdk /Volumes/T7/Android/sdk /Volumes/T7/Android/Sdk; do
@@ -138,10 +143,16 @@ cp -R "$TPL/app/src/main/java/org" "$APP/app/sdl-java/"
 cp -R "$WORK/android/app/." "$APP/app/"
 echo "sdk.dir=$ANDROID_HOME" > "$APP/local.properties"
 LIBS="$APP/app/libs/arm64-v8a"
-cp -f "$OBJ/libdmc4.so" "$LIBS/" || fail "нет libdmc4.so"
+# Код игры (libdmc4.so) в APK не кладётся: телефон собирает его сам из default.xex игрока
+# (make_kit.sh + GameBuild.java). BUNDLE_GAME_LIB=1 — положить готовый, для быстрых тестов.
+if [ "${BUNDLE_GAME_LIB:-0}" = "1" ]; then
+  cp -f "$OBJ/libdmc4.so" "$LIBS/" || fail "нет libdmc4.so"
+fi
 cp -f "$(find "$OBJ" "$SDK_PREFIX" -name librexgpu-xenos.so | head -1)" "$LIBS/" || fail "нет librexgpu-xenos.so"
 cp -f "$(find "$SDK_PREFIX" "$SDK_OBJ" -name librexruntime.so | head -1)" "$LIBS/" || fail "нет librexruntime.so"
 cp -f "$(find "$NDK/toolchains/llvm/prebuilt" -path "*aarch64-linux-android/libc++_shared.so" | head -1)" "$LIBS/" || fail "нет libc++_shared.so"
+step "Набор для сборки кода игры на телефоне"
+NDK="$NDK" bash "$WORK/make_kit.sh" "$APP" || fail "make_kit.sh"
 ls -la "$LIBS"
 
 step "APK (Gradle)"
