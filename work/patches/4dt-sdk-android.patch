@@ -1905,7 +1905,7 @@ index e2983a4..5df6034 100644
  REXCVAR_DEFINE_BOOL(depth_float24_convert_in_pixel_shader, false, "GPU",
                      "Convert float24 depth in pixel shader");
 diff --git a/src/graphics/pipeline/render_target/cache.cpp b/src/graphics/pipeline/render_target/cache.cpp
-index 953c5fd..265b4a7 100644
+index 953c5fd..5662a09 100644
 --- a/src/graphics/pipeline/render_target/cache.cpp
 +++ b/src/graphics/pipeline/render_target/cache.cpp
 @@ -27,6 +27,32 @@
@@ -1989,7 +1989,7 @@ index 953c5fd..265b4a7 100644
  bool RenderTargetCache::Update(bool is_rasterization_done,
                                 reg::RB_DEPTHCONTROL normalized_depth_control,
                                 uint32_t normalized_color_mask, const Shader& vertex_shader) {
-@@ -695,6 +762,116 @@ bool RenderTargetCache::Update(bool is_rasterization_done,
+@@ -695,6 +762,122 @@ bool RenderTargetCache::Update(bool is_rasterization_done,
      return true;
    }
  
@@ -2091,14 +2091,20 @@ index 953c5fd..265b4a7 100644
 +  }
 +  // Anything drawn into a render target (except the recorded clear itself) ends its "only a
 +  // clear value" state.
-+  if (g_4dt_uniform_clear_draw != g_4dt_draw_serial && !g_4dt_uniform_clears.empty()) {
++  // A render target bound for the recorded clear draw keeps only the entry this draw
++  // recorded (one it didn't record - e.g. depth cleared without stencil - is stale now).
++  if (!g_4dt_uniform_clears.empty()) {
++    const uint64_t serial = g_4dt_draw_serial;
++    const bool clear_draw = g_4dt_uniform_clear_draw == serial;
 +    for (uint32_t i = 0; i < edram_bases_sorted_count; ++i) {
 +      RenderTarget* rt = rts[edram_bases_sorted[i].second];
 +      if (!rt) continue;
 +      uint32_t key = rt->key().key;
 +      g_4dt_uniform_clears.erase(
 +          std::remove_if(g_4dt_uniform_clears.begin(), g_4dt_uniform_clears.end(),
-+                         [key](const Dmc4UniformClear& c) { return c.key == key; }),
++                         [key, serial, clear_draw](const Dmc4UniformClear& c) {
++                           return c.key == key && !(clear_draw && c.draw_serial == serial);
++                         }),
 +          g_4dt_uniform_clears.end());
 +    }
 +  }
@@ -2108,10 +2114,10 @@ index 953c5fd..265b4a7 100644
      last_update_used_render_targets_[i] =
 diff --git a/src/graphics/pipeline/render_target/dmc4_uniform_clear.h b/src/graphics/pipeline/render_target/dmc4_uniform_clear.h
 new file mode 100644
-index 0000000..4560967
+index 0000000..b0abfd6
 --- /dev/null
 +++ b/src/graphics/pipeline/render_target/dmc4_uniform_clear.h
-@@ -0,0 +1,23 @@
+@@ -0,0 +1,24 @@
 +// [4DevilTears] Shared between the render target cache and its Vulkan backend (kept out of the
 +// public SDK headers).
 +#pragma once
@@ -2123,6 +2129,7 @@ index 0000000..4560967
 +  uint32_t key;  // RenderTargetKey::key
 +  uint32_t start_tiles, end_tiles;
 +  uint64_t value;  // guest-packed clear value (RB_COLOR_CLEAR / RB_DEPTH_CLEAR encoding)
++  uint64_t draw_serial;  // the clear draw that recorded it
 +};
 +using Dmc4UniformClearList = std::vector<Dmc4UniformClear>;
 +struct Dmc4UniformFill {
@@ -8104,7 +8111,7 @@ index 0000000..4812f2a
 +
 +}  // namespace rex::graphics::vulkan::bc_decode
 diff --git a/src/graphics/vulkan/command_processor.cpp b/src/graphics/vulkan/command_processor.cpp
-index 001f36b..4358bde 100644
+index 001f36b..27d708d 100644
 --- a/src/graphics/vulkan/command_processor.cpp
 +++ b/src/graphics/vulkan/command_processor.cpp
 @@ -9,7 +9,10 @@
@@ -8202,7 +8209,7 @@ index 001f36b..4358bde 100644
 +                    "[4DevilTears] Pass-to-pass barrier also between draw passes on the same "
 +                    "attachments (not only around ownership transfer passes)")
 +    .lifecycle(rex::cvar::Lifecycle::kHotReload);
-+REXCVAR_DEFINE_BOOL(collapse_predicated_tiling, false, "GPU",
++REXCVAR_DEFINE_BOOL(collapse_predicated_tiling, true, "GPU",
 +                    "[4DevilTears] Experimental: render predicated tiling bands (the scene drawn "
 +                    "3 times, once per screen band) as one full-height pass - the first band is "
 +                    "drawn with the full scissor, the draws of the other bands are skipped and "
@@ -8430,7 +8437,7 @@ index 001f36b..4358bde 100644
    for (const auto& command_buffer_pair : command_buffers_submitted_) {
      dfn.vkDestroyCommandPool(device, command_buffer_pair.second.pool, nullptr);
    }
-@@ -2269,8 +2526,317 @@ void VulkanCommandProcessor::OnGammaRampPWLValueWritten() {
+@@ -2269,8 +2526,319 @@ void VulkanCommandProcessor::OnGammaRampPWLValueWritten() {
    gamma_ramp_pwl_current_frame_ = UINT32_MAX;
  }
  
@@ -8737,6 +8744,8 @@ index 001f36b..4358bde 100644
 +  }
 +  gpu_stats::OnFrame();
 +  ProfileReport();
++  // [4DevilTears] "Holds only a clear value" is trusted within a frame only.
++  g_4dt_uniform_clears.clear();
 +  BandCollapseOnFrame();
 +  {
 +    static uint32_t swaps_since_cache_flush = 0;
@@ -8748,7 +8757,7 @@ index 001f36b..4358bde 100644
    SCOPE_profile_cpu_f("gpu");
    vertex_buffers_in_sync_[0] = 0;
    vertex_buffers_in_sync_[1] = 0;
-@@ -2292,6 +2858,19 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
+@@ -2292,6 +2860,19 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
    bool skip_present_due_async_placeholder = REXCVAR_GET(async_shader_compilation) &&
                                              REXCVAR_GET(vulkan_async_skip_incomplete_frames) &&
                                              frame_used_async_placeholder_pipeline_;
@@ -8768,7 +8777,7 @@ index 001f36b..4358bde 100644
    if (skip_present_due_async_placeholder) {
      static bool skipped_incomplete_frame_logged = false;
      if (!skipped_incomplete_frame_logged) {
-@@ -2855,7 +3434,8 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
+@@ -2855,7 +3436,8 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
            render_pass_begin_info.renderArea.extent.height = guest_output_height;
            render_pass_begin_info.clearValueCount = 0;
            render_pass_begin_info.pClearValues = nullptr;
@@ -8778,7 +8787,7 @@ index 001f36b..4358bde 100644
                                                          VK_SUBPASS_CONTENTS_INLINE);
  
            VkViewport viewport;
-@@ -3091,13 +3671,22 @@ bool VulkanCommandProcessor::SubmitBarriers(bool force_end_render_pass) {
+@@ -3091,13 +3673,22 @@ bool VulkanCommandProcessor::SubmitBarriers(bool force_end_render_pass) {
  void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
      VkRenderPass render_pass, const VulkanRenderTargetCache::Framebuffer* framebuffer) {
    SubmitBarriers(false);
@@ -8802,7 +8811,7 @@ index 001f36b..4358bde 100644
        return;
      }
    } else {
-@@ -3107,16 +3696,22 @@ void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
+@@ -3107,16 +3698,22 @@ void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
    }
  
    if (in_render_pass_) {
@@ -8825,7 +8834,7 @@ index 001f36b..4358bde 100644
  
    if (use_dynamic_rendering) {
      VkRenderingAttachmentInfo color_attachments[xenos::kMaxColorRenderTargets];
-@@ -3141,6 +3736,9 @@ void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
+@@ -3141,6 +3738,9 @@ void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
      rendering_info.pColorAttachments = color_attachment_count ? color_attachments : nullptr;
      rendering_info.pDepthAttachment = has_depth ? &depth_attachment : nullptr;
      rendering_info.pStencilAttachment = has_stencil ? &stencil_attachment : nullptr;
@@ -8835,7 +8844,7 @@ index 001f36b..4358bde 100644
      deferred_command_buffer_.CmdVkBeginRendering(&rendering_info);
    } else {
      VkRenderPassBeginInfo render_pass_begin_info;
-@@ -3155,10 +3753,14 @@ void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
+@@ -3155,10 +3755,14 @@ void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
      render_pass_begin_info.renderArea.extent = framebuffer->host_extent;
      render_pass_begin_info.clearValueCount = 0;
      render_pass_begin_info.pClearValues = nullptr;
@@ -8850,7 +8859,7 @@ index 001f36b..4358bde 100644
  }
  
  void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
-@@ -3171,7 +3773,7 @@ void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
+@@ -3171,7 +3775,7 @@ void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
  
    if (use_dynamic_rendering) {
      if (in_render_pass_ && current_framebuffer_ == framebuffer &&
@@ -8859,7 +8868,7 @@ index 001f36b..4358bde 100644
        return;
      }
    } else {
-@@ -3181,16 +3783,22 @@ void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
+@@ -3181,16 +3785,22 @@ void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
    }
  
    if (in_render_pass_) {
@@ -8882,7 +8891,7 @@ index 001f36b..4358bde 100644
  
    if (use_dynamic_rendering) {
      VkRenderingAttachmentInfo color_attachment = {};
-@@ -3235,6 +3843,9 @@ void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
+@@ -3235,6 +3845,9 @@ void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
      rendering_info.pColorAttachments = transfer_dest_is_depth ? nullptr : &color_attachment;
      rendering_info.pDepthAttachment = transfer_dest_is_depth ? &depth_attachment : nullptr;
      rendering_info.pStencilAttachment = transfer_dest_is_depth ? &stencil_attachment : nullptr;
@@ -8892,7 +8901,7 @@ index 001f36b..4358bde 100644
      deferred_command_buffer_.CmdVkBeginRendering(&rendering_info);
    } else {
      VkRenderPassBeginInfo render_pass_begin_info;
-@@ -3247,10 +3858,160 @@ void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
+@@ -3247,10 +3860,160 @@ void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
      render_pass_begin_info.renderArea.extent = framebuffer->host_extent;
      render_pass_begin_info.clearValueCount = 0;
      render_pass_begin_info.pClearValues = nullptr;
@@ -9053,7 +9062,7 @@ index 001f36b..4358bde 100644
  }
  
  void VulkanCommandProcessor::EndRenderPass() {
-@@ -3258,13 +4019,19 @@ void VulkanCommandProcessor::EndRenderPass() {
+@@ -3258,13 +4021,19 @@ void VulkanCommandProcessor::EndRenderPass() {
    if (!in_render_pass_) {
      return;
    }
@@ -9073,7 +9082,7 @@ index 001f36b..4358bde 100644
    in_render_pass_ = false;
  }
  
-@@ -3587,13 +4354,210 @@ Shader* VulkanCommandProcessor::LoadShader(xenos::ShaderType shader_type, uint32
+@@ -3587,13 +4356,210 @@ Shader* VulkanCommandProcessor::LoadShader(xenos::ShaderType shader_type, uint32
    return pipeline_cache_->LoadShader(shader_type, host_address, dword_count);
  }
  
@@ -9285,7 +9294,7 @@ index 001f36b..4358bde 100644
    const RegisterFile& regs = *register_file_;
    (void)index_buffer_info;
    auto draw_fail = [&](const char* stage) {
-@@ -3629,13 +4593,56 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
+@@ -3629,13 +4595,56 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
      return draw_fail("missing_vertex_shader");
    }
    pipeline_cache_->AnalyzeShaderUcode(*vertex_shader);
@@ -9346,7 +9355,7 @@ index 001f36b..4358bde 100644
      }
      draw_util::AddMemExportRanges(regs, *vertex_shader, memexport_ranges_);
    }
-@@ -3681,6 +4688,365 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
+@@ -3681,6 +4690,365 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
    }
    reg::RB_DEPTHCONTROL normalized_depth_control = draw_util::GetNormalizedDepthControl(regs);
  
@@ -9712,7 +9721,7 @@ index 001f36b..4358bde 100644
    uint32_t ps_param_gen_pos = UINT32_MAX;
    uint32_t interpolator_mask =
        pixel_shader ? (vertex_shader->writes_interpolators() &
-@@ -3835,6 +5201,7 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
+@@ -3835,6 +5203,7 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
    uint32_t used_texture_mask =
        vertex_shader->GetUsedTextureMaskAfterTranslation() |
        (pixel_shader != nullptr ? pixel_shader->GetUsedTextureMaskAfterTranslation() : 0);
@@ -9720,7 +9729,7 @@ index 001f36b..4358bde 100644
    texture_cache_->RequestTextures(used_texture_mask);
  
    const VulkanPipelineCache::PipelineLayoutProvider* pipeline_layout_provider;
-@@ -4111,14 +5478,22 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
+@@ -4111,14 +5480,22 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
    // After all commands that may dispatch, copy or insert barriers, submit
    // the barriers (may end the render pass), and (re)enter the render pass
    // before drawing.
@@ -9743,7 +9752,7 @@ index 001f36b..4358bde 100644
      deferred_command_buffer_.CmdVkDraw(primitive_processing_result.host_draw_vertex_count, 1, 0, 0);
    } else {
      std::pair<VkBuffer, VkDeviceSize> index_buffer;
-@@ -4150,10 +5525,33 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
+@@ -4150,10 +5527,33 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
          primitive_processing_result.host_index_format == xenos::IndexFormat::kInt16
              ? VK_INDEX_TYPE_UINT16
              : VK_INDEX_TYPE_UINT32);
@@ -9777,7 +9786,7 @@ index 001f36b..4358bde 100644
    // Invalidate textures in memexported memory and watch for changes.
    if (!memexport_ranges_.empty()) {
      for (const draw_util::MemExportRange& memexport_range : memexport_ranges_) {
-@@ -4382,6 +5780,46 @@ bool VulkanCommandProcessor::IssueDraw_MemexportReadbackFastPath(uint32_t total_
+@@ -4382,6 +5782,46 @@ bool VulkanCommandProcessor::IssueDraw_MemexportReadbackFastPath(uint32_t total_
  }
  
  bool VulkanCommandProcessor::IssueCopy() {
@@ -9824,7 +9833,7 @@ index 001f36b..4358bde 100644
  #if XE_GPU_FINE_GRAINED_DRAW_SCOPES
    SCOPE_profile_cpu_f("gpu");
  #endif  // XE_GPU_FINE_GRAINED_DRAW_SCOPES
-@@ -4393,8 +5831,22 @@ bool VulkanCommandProcessor::IssueCopy() {
+@@ -4393,8 +5833,22 @@ bool VulkanCommandProcessor::IssueCopy() {
    ReadbackResolveMode readback_mode = GetReadbackResolveMode(REXCVAR_GET(vulkan_readback_resolve));
    if (readback_mode == ReadbackResolveMode::kDisabled) {
      uint32_t written_address, written_length;
@@ -9849,7 +9858,7 @@ index 001f36b..4358bde 100644
    }
  
    return IssueCopy_ReadbackResolvePath();
-@@ -5016,6 +6468,77 @@ void VulkanCommandProcessor::CheckSubmissionFenceAndDeviceLoss(uint64_t await_su
+@@ -5016,6 +6470,77 @@ void VulkanCommandProcessor::CheckSubmissionFenceAndDeviceLoss(uint64_t await_su
                                        submissions_in_flight_fences_awaited_end);
    submission_completed_ += fences_awaited;
  
@@ -9927,7 +9936,7 @@ index 001f36b..4358bde 100644
    // Reclaim semaphores.
    while (!submissions_in_flight_semaphores_.empty()) {
      const auto& semaphore_submission = submissions_in_flight_semaphores_.front();
-@@ -5136,6 +6659,29 @@ bool VulkanCommandProcessor::BeginSubmission(bool is_guest_command) {
+@@ -5136,6 +6661,29 @@ bool VulkanCommandProcessor::BeginSubmission(bool is_guest_command) {
      // the end of the submission (when async pipeline object creation requests
      // are fulfilled).
      deferred_command_buffer_.Reset();
@@ -9957,7 +9966,7 @@ index 001f36b..4358bde 100644
  
      // Reset cached state of the command buffer.
      dynamic_viewport_update_needed_ = true;
-@@ -5150,6 +6696,7 @@ bool VulkanCommandProcessor::BeginSubmission(bool is_guest_command) {
+@@ -5150,6 +6698,7 @@ bool VulkanCommandProcessor::BeginSubmission(bool is_guest_command) {
      dynamic_stencil_reference_back_update_needed_ = true;
      current_render_pass_ = VK_NULL_HANDLE;
      current_framebuffer_ = nullptr;
@@ -9965,7 +9974,7 @@ index 001f36b..4358bde 100644
      in_render_pass_ = false;
      current_guest_graphics_pipeline_ = VK_NULL_HANDLE;
      current_external_graphics_pipeline_ = VK_NULL_HANDLE;
-@@ -5385,7 +6932,81 @@ bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
+@@ -5385,7 +6934,81 @@ bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
        REXGPU_ERROR("Failed to begin a Vulkan command buffer");
        return false;
      }
@@ -11168,7 +11177,7 @@ index 91ac08f..ee976e5 100644
        }
      }
 diff --git a/src/graphics/vulkan/render_target_cache.cpp b/src/graphics/vulkan/render_target_cache.cpp
-index 0298f06..3f7077b 100644
+index 0298f06..5b37a86 100644
 --- a/src/graphics/vulkan/render_target_cache.cpp
 +++ b/src/graphics/vulkan/render_target_cache.cpp
 @@ -10,6 +10,10 @@
@@ -11552,7 +11561,7 @@ index 0298f06..3f7077b 100644
 +  if (g_4dt_uniform_clears.size() >= 32) {
 +    g_4dt_uniform_clears.erase(g_4dt_uniform_clears.begin());
 +  }
-+  g_4dt_uniform_clears.push_back({k, start, end, value});
++  g_4dt_uniform_clears.push_back({k, start, end, value, g_4dt_draw_serial});
 +}
 +
 +bool VulkanRenderTargetCache::ClearRenderTargetTiles(RenderTarget* render_target,
