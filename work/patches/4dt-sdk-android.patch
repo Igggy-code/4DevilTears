@@ -630,10 +630,10 @@ index 7b938b9..52f3f9e 100644
  
    // Thread for asynchronous writing to the storage streams.
 diff --git a/include/rex/graphics/vulkan/render_target_cache.h b/include/rex/graphics/vulkan/render_target_cache.h
-index 34f7033..3aeb250 100644
+index 34f7033..7305ea4 100644
 --- a/include/rex/graphics/vulkan/render_target_cache.h
 +++ b/include/rex/graphics/vulkan/render_target_cache.h
-@@ -109,6 +109,56 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
+@@ -109,6 +109,66 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
                 VulkanTextureCache& texture_cache, uint32_t& written_address_out,
                 uint32_t& written_length_out);
  
@@ -668,6 +668,9 @@ index 34f7033..3aeb250 100644
 +    // Render target and frame of the last fast resolve into the alias.
 +    uint32_t last_source_key = 0;
 +    uint64_t last_source_frame = 0;
++    // The last fast resolve went straight into the consuming texture (zero-copy) - the
++    // alias image itself doesn't have it.
++    bool zero_copy_last = false;
 +  };
 +  // For the texture cache. Returns the alias whose destination starts at the address.
 +  ResolveAlias* FindResolveAlias(uint32_t address);
@@ -675,6 +678,13 @@ index 34f7033..3aeb250 100644
 +  // incompatible - something else reads their memory.
 +  void MarkResolveAliasesOverlappingAsIncompatible(uint32_t start, uint32_t length,
 +                                                   uint32_t except_address);
++  // [4DevilTears] A texture whose guest memory spans fast resolve destinations (e.g. bloom
++  // levels resolved one under another and sampled as one tall texture): collects the aliases
++  // whose data the texture needs from the GPU (stacked at whole 32-row tile rows with the same
++  // pitch). Returns false if one of them can't be placed that way.
++  bool Dmc4CollectStackedAliases(uint32_t start, uint32_t length, uint32_t pitch,
++                                 uint32_t endian, std::vector<ResolveAlias*>& aliases_out,
++                                 std::vector<uint32_t>& rows_out);
 +  // Transitions the alias image for use as a transfer source.
 +  void UseResolveAliasAsCopySource(ResolveAlias& alias);
 +
@@ -690,7 +700,7 @@ index 34f7033..3aeb250 100644
    bool Update(bool is_rasterization_done, reg::RB_DEPTHCONTROL normalized_depth_control,
                uint32_t normalized_color_mask, const Shader& vertex_shader) override;
    // Binding information for the last successful update.
-@@ -159,6 +209,10 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
+@@ -159,6 +219,10 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
  
    VkFormat GetDepthVulkanFormat(xenos::DepthRenderTargetFormat format) const;
    VkFormat GetColorVulkanFormat(xenos::ColorRenderTargetFormat format) const;
@@ -701,7 +711,7 @@ index 34f7033..3aeb250 100644
    VkFormat GetColorOwnershipTransferVulkanFormat(
        xenos::ColorRenderTargetFormat format,
        xenos::MsaaSamples msaa_samples = xenos::MsaaSamples::k1X,
-@@ -177,6 +231,21 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
+@@ -177,6 +241,21 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
    void RequestPixelShaderInterlockBarrier() override;
  
   private:
@@ -9959,10 +9969,10 @@ index b49e033..c3c647a 100644
  
 diff --git a/src/graphics/vulkan/fast_resolve.cpp b/src/graphics/vulkan/fast_resolve.cpp
 new file mode 100644
-index 0000000..c11b076
+index 0000000..0710d8e
 --- /dev/null
 +++ b/src/graphics/vulkan/fast_resolve.cpp
-@@ -0,0 +1,662 @@
+@@ -0,0 +1,695 @@
 +/**
 + * [4deviltears] Fast resolves for the Vulkan render target cache.
 + *
@@ -10233,6 +10243,38 @@ index 0000000..c11b076
 +                  alias.address, alias.width, alias.height, start, length);
 +    }
 +  }
++}
++
++bool VulkanRenderTargetCache::Dmc4CollectStackedAliases(uint32_t start, uint32_t length,
++                                                        uint32_t pitch, uint32_t endian,
++                                                        std::vector<ResolveAlias*>& aliases_out,
++                                                        std::vector<uint32_t>& rows_out) {
++  aliases_out.clear();
++  rows_out.clear();
++  const uint32_t tile_row_bytes = pitch * 32 * 4;
++  for (auto& alias_pair : resolve_aliases_) {
++    ResolveAlias& alias = alias_pair.second;
++    if (!(start < alias.address + alias.extent_length && alias.address < start + length)) {
++      continue;
++    }
++    // Resolved to memory as well (or only) - guest memory already has it.
++    if (alias.incompatible || g_overlap_read_aliases.count(alias.address)) {
++      continue;
++    }
++    if (alias.zero_copy_last) {
++      return false;  // the data is in the consuming texture, not in the alias
++    }
++    if (!alias.written) {
++      continue;  // no fast resolve since the last regular one
++    }
++    if (alias.width != pitch || alias.endian != endian || alias.address < start ||
++        !tile_row_bytes || (alias.address - start) % tile_row_bytes) {
++      return false;
++    }
++    aliases_out.push_back(&alias);
++    rows_out.push_back((alias.address - start) / tile_row_bytes * 32);
++  }
++  return true;
 +}
 +
 +void VulkanRenderTargetCache::UseResolveAliasAsCopySource(ResolveAlias& alias) {
@@ -10592,6 +10634,7 @@ index 0000000..c11b076
 +  command_buffer.CmdVkPushConstants(layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(constants),
 +                                    &constants);
 +  command_buffer.CmdVkDispatch((width + 7) / 8, (height + 7) / 8, 1);
++  alias->zero_copy_last = zero_copy_texture != nullptr;
 +  if (zero_copy_texture) {
 +    g_4dt_resolve_texture_cache->Dmc4ZeroCopyEndWrite(zero_copy_texture);
 +    g_4dt_zero_copy_pending = zero_copy_texture;
@@ -11765,7 +11808,7 @@ index 6788214..04b716d 100644
    DeferredCommandBuffer& command_buffer = command_processor_.deferred_command_buffer();
    uint64_t submission_current = command_processor_.GetCurrentSubmission();
 diff --git a/src/graphics/vulkan/texture_cache.cpp b/src/graphics/vulkan/texture_cache.cpp
-index ecbd940..c881b65 100644
+index ecbd940..e997bc1 100644
 --- a/src/graphics/vulkan/texture_cache.cpp
 +++ b/src/graphics/vulkan/texture_cache.cpp
 @@ -10,6 +10,8 @@
@@ -11777,7 +11820,7 @@ index ecbd940..c881b65 100644
  #include <array>
  #include <cstddef>
  #include <cstring>
-@@ -27,14 +29,58 @@
+@@ -27,14 +29,62 @@
  #include <rex/graphics/vulkan/command_processor.h>
  #include <rex/graphics/vulkan/deferred_command_buffer.h>
  #include <rex/graphics/vulkan/texture_cache.h>
@@ -11818,6 +11861,10 @@ index ecbd940..c881b65 100644
 +uint32_t g_4dt_vertex_texture_mask = 0;
 +std::unordered_set<const void*> g_4dt_fragment_only_textures;
 +}  // namespace rex::graphics::vulkan
++REXCVAR_DEFINE_BOOL(fast_resolve_stacked, true, "GPU",
++                    "[4DevilTears] A texture spanning several fast resolve destinations stacked "
++                    "in memory (bloom levels sampled as one texture) gets them copied on the GPU "
++                    "after the memory load - those resolves don't have to go to memory too");
 +REXCVAR_DEFINE_BOOL(fast_resolve_overlap_on_memory_reads_only, true, "GPU",
 +                    "[4DevilTears] A texture overlapping fast resolve destinations makes them keep "
 +                    "the regular resolve only if it is really loaded from guest memory (not when "
@@ -11836,7 +11883,7 @@ index ecbd940..c881b65 100644
  namespace rex::graphics::vulkan {
  
  // Generated with `xb buildshaders`.
-@@ -584,6 +630,42 @@ void VulkanTextureCache::RequestTextures(uint32_t used_texture_mask) {
+@@ -584,6 +634,42 @@ void VulkanTextureCache::RequestTextures(uint32_t used_texture_mask) {
    VkImageLayout new_layout;
    GetTextureUsageMasks(VulkanTexture::Usage::kGuestShaderSampled, dst_stage_mask, dst_access_mask,
                         new_layout);
@@ -11879,7 +11926,7 @@ index ecbd940..c881b65 100644
    uint32_t textures_remaining = used_texture_mask;
    uint32_t index;
    while (rex::bit_scan_forward(textures_remaining, &index)) {
-@@ -594,36 +676,11 @@ void VulkanTextureCache::RequestTextures(uint32_t used_texture_mask) {
+@@ -594,36 +680,11 @@ void VulkanTextureCache::RequestTextures(uint32_t used_texture_mask) {
      }
      VulkanTexture* binding_texture = static_cast<VulkanTexture*>(binding->texture);
      if (binding_texture != nullptr) {
@@ -11918,7 +11965,7 @@ index ecbd940..c881b65 100644
      }
    }
  }
-@@ -878,6 +935,12 @@ VkSampler VulkanTextureCache::UseSampler(SamplerParameters parameters, bool& has
+@@ -878,6 +939,12 @@ VkSampler VulkanTextureCache::UseSampler(SamplerParameters parameters, bool& has
    } else {
      sampler_create_info.maxLod = VK_LOD_CLAMP_NONE;
    }
@@ -11931,7 +11978,7 @@ index ecbd940..c881b65 100644
    bool uses_custom_border_color = false;
    VkSamplerCustomBorderColorCreateInfoEXT sampler_custom_border_color_create_info = {};
    const bool custom_border_colors_supported = vulkan_device->properties().customBorderColors;
-@@ -980,6 +1043,33 @@ uint64_t VulkanTextureCache::GetSubmissionToAwaitOnSamplerOverflow(
+@@ -980,6 +1047,33 @@ uint64_t VulkanTextureCache::GetSubmissionToAwaitOnSamplerOverflow(
    return sampler_used->second.last_usage_submission;
  }
  
@@ -11965,7 +12012,7 @@ index ecbd940..c881b65 100644
  VkImageView VulkanTextureCache::RequestSwapTexture(uint32_t& width_scaled_out,
                                                     uint32_t& height_scaled_out,
                                                     xenos::TextureFormat& format_out,
-@@ -1173,7 +1263,9 @@ std::unique_ptr<TextureCache::Texture> VulkanTextureCache::CreateTexture(Texture
+@@ -1173,7 +1267,9 @@ std::unique_ptr<TextureCache::Texture> VulkanTextureCache::CreateTexture(Texture
    image_create_info.arrayLayers = is_3d ? 1 : depth_or_array_size;
    image_create_info.samples = VK_SAMPLE_COUNT_1_BIT;
    image_create_info.tiling = VK_IMAGE_TILING_OPTIMAL;
@@ -11976,7 +12023,7 @@ index ecbd940..c881b65 100644
    image_create_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
    image_create_info.queueFamilyIndexCount = 0;
    image_create_info.pQueueFamilyIndices = nullptr;
-@@ -1189,6 +1281,33 @@ std::unique_ptr<TextureCache::Texture> VulkanTextureCache::CreateTexture(Texture
+@@ -1189,6 +1285,46 @@ std::unique_ptr<TextureCache::Texture> VulkanTextureCache::CreateTexture(Texture
      image_format_list_create_info.pViewFormats = formats;
    }
  
@@ -12007,10 +12054,23 @@ index ecbd940..c881b65 100644
 +    }
 +  }
 +
++  if (!zero_copy && command_processor_.render_target_cache() &&
++      command_processor_.render_target_cache()->FindResolveAlias(zero_copy_address)) {
++    static std::unordered_set<uint32_t> logged;
++    if (logged.insert(zero_copy_address).second) {
++      REXGPU_INFO("Fast resolve: texture at {:08X} ({}x{} format {}) not zero-copy: host formats "
++                  "{}/{} tiled {} scaled {} dimension {} layers {} mips {}",
++                  zero_copy_address, key.GetWidth(), key.GetHeight(), uint32_t(key.format),
++                  uint32_t(formats[0]), uint32_t(formats[1]), uint32_t(key.tiled),
++                  uint32_t(key.scaled_resolve), uint32_t(key.dimension), depth_or_array_size,
++                  uint32_t(key.mip_max_level));
++    }
++  }
++
    VmaAllocationCreateInfo allocation_create_info = {};
    allocation_create_info.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE;
  
-@@ -1199,7 +1318,13 @@ std::unique_ptr<TextureCache::Texture> VulkanTextureCache::CreateTexture(Texture
+@@ -1199,7 +1335,13 @@ std::unique_ptr<TextureCache::Texture> VulkanTextureCache::CreateTexture(Texture
      return nullptr;
    }
  
@@ -12025,7 +12085,7 @@ index ecbd940..c881b65 100644
  }
  
  bool VulkanTextureCache::EnsureScaledResolveMemoryCommitted(uint32_t start_unscaled,
-@@ -1215,6 +1340,12 @@ bool VulkanTextureCache::EnsureScaledResolveMemoryCommitted(uint32_t start_unsca
+@@ -1215,6 +1357,12 @@ bool VulkanTextureCache::EnsureScaledResolveMemoryCommitted(uint32_t start_unsca
  
  bool VulkanTextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture, bool load_base,
                                                                 bool load_mips) {
@@ -12038,10 +12098,13 @@ index ecbd940..c881b65 100644
    VulkanTexture& vulkan_texture = static_cast<VulkanTexture&>(texture);
    TextureKey texture_key = vulkan_texture.key();
  
-@@ -1237,6 +1368,126 @@ bool VulkanTextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture,
+@@ -1237,6 +1385,184 @@ bool VulkanTextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture,
    if (pipeline == VK_NULL_HANDLE) {
      return false;
    }
++  // [4DevilTears] Fast resolve destinations stacked inside this texture, copied after the load.
++  std::vector<VulkanRenderTargetCache::ResolveAlias*> stacked_aliases;
++  std::vector<uint32_t> stacked_rows;
 +  // [4deviltears] Texture written by a fast resolve - copy the resolve alias image
 +  // (32-bit words of the destination format) instead of untiling guest memory.
 +  if (load_base) {
@@ -12132,6 +12195,20 @@ index ecbd940..c881b65 100644
 +                        texture_address, width, height, uint32_t(texture_key.format));
 +          }
 +          gpu_stats::Add(gpu_stats::kAliasCopies, 1);
++          {
++            // [4DevilTears] Which textures still take the alias copy (not zero-copy).
++            static std::unordered_map<uint32_t, uint32_t> copies_by_address;
++            static uint32_t copies_total = 0;
++            ++copies_by_address[texture_address];
++            if (++copies_total % 1200 == 0) {
++              std::string list;
++              for (const auto& [address, count] : copies_by_address) {
++                list += fmt::format(" {:08X}x{}{}", address, count,
++                                    g_4dt_zero_copy.count(&vulkan_texture) ? "" : "(no zc)");
++              }
++              REXGPU_INFO("ALIASCOPY {} so far:{}", copies_total, list);
++            }
++          }
 +          if (frame_trace::Active()) {
 +            // Checkpoint: the texture as the following draws will sample it.
 +            VkPipelineStageFlags stage;
@@ -12158,14 +12235,55 @@ index ecbd940..c881b65 100644
 +              uint32_t(texture_key.mip_max_level));
 +        }
 +      }
-+      mark_overlapping();  // guest memory is read below
++      // [4DevilTears] Guest memory is read below. Resolves stacked inside the texture at whole
++      // tile rows are copied from their aliases after the load instead of forcing them to
++      // memory as well.
++      bool stacked = false;
++      if (!overlap_marked && REXCVAR_GET(fast_resolve_stacked)) {
++        bool stack_format =
++            (host_format.format == VK_FORMAT_R8G8B8A8_UNORM ||
++             host_format.format == VK_FORMAT_A2B10G10R10_UNORM_PACK32 ||
++             host_format.format == VK_FORMAT_R32_SFLOAT) &&
++            (texture_key.format == xenos::TextureFormat::k_8_8_8_8 ||
++             texture_key.format == xenos::TextureFormat::k_2_10_10_10 ||
++             texture_key.format == xenos::TextureFormat::k_2_10_10_10_AS_16_16_16_16 ||
++             texture_key.format == xenos::TextureFormat::k_24_8 ||
++             texture_key.format == xenos::TextureFormat::k_24_8_FLOAT) &&
++            !host_format_is_signed && texture_key.tiled && !texture_key.scaled_resolve &&
++            texture_key.dimension == xenos::DataDimension::k2DOrStacked &&
++            texture_key.GetDepthOrArraySize() == 1 &&
++            (!load_mips || texture_key.mip_max_level == 0);
++        stacked = stack_format && render_target_cache->Dmc4CollectStackedAliases(
++                                      texture_address, vulkan_texture.GetGuestBaseSize(),
++                                      uint32_t(texture_key.pitch) << 5,
++                                      uint32_t(texture_key.endianness), stacked_aliases,
++                                      stacked_rows);
++        static std::unordered_set<uint64_t> logged;
++        if (logged.insert((uint64_t(texture_address) << 32) | vulkan_texture.GetGuestBaseSize())
++                .second) {
++          REXGPU_INFO("Fast resolve: texture {:08X}+{:X} {}x{} pitch {} format {} mips {}: {}",
++                      texture_address, vulkan_texture.GetGuestBaseSize(),
++                      texture_key.GetWidth(), texture_key.GetHeight(),
++                      uint32_t(texture_key.pitch) << 5, uint32_t(texture_key.format),
++                      uint32_t(texture_key.mip_max_level),
++                      stacked ? fmt::format("{} resolves stacked in it copied on the GPU",
++                                            stacked_aliases.size())
++                              : std::string("regular memory load"));
++        }
++        if (!stacked) {
++          stacked_aliases.clear();
++        }
++      }
++      if (!stacked) {
++        mark_overlapping();
++      }
 +    }
 +  }
 +
    const LoadShaderInfo& load_shader_info = GetLoadShaderInfo(load_shader);
    LoadShaderIndex load_shader_float_convert = kLoadShaderIndexUnknown;
    if (host_format.format == VK_FORMAT_R16G16B16A16_SFLOAT) {
-@@ -1741,6 +1992,57 @@ bool VulkanTextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture,
+@@ -1741,6 +2067,57 @@ bool VulkanTextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture,
          texture_dst_access_mask, texture_old_layout, texture_new_layout);
    }
    command_processor_.SubmitBarriers(true);
@@ -12223,7 +12341,53 @@ index ecbd940..c881b65 100644
    VkBufferImageCopy* copy_regions = command_buffer.CmdCopyBufferToImageEmplace(
        scratch_buffer, vulkan_texture.image(), VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
        level_last - level_first + 1);
-@@ -1857,6 +2159,22 @@ VulkanTextureCache::VulkanTexture::~VulkanTexture() {
+@@ -1783,6 +2160,45 @@ bool VulkanTextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture,
+     copy_region.imageExtent.depth = std::max(depth >> level, UINT32_C(1));
+   }
+ 
++  if (!stacked_aliases.empty()) {
++    // [4DevilTears] This frame's fast resolves over the (stale) memory contents.
++    VulkanRenderTargetCache* render_target_cache = command_processor_.render_target_cache();
++    command_processor_.PushImageMemoryBarrier(
++        vulkan_texture.image(), ui::vulkan::util::InitializeSubresourceRange(),
++        VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
++        VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
++        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
++    for (VulkanRenderTargetCache::ResolveAlias* alias : stacked_aliases) {
++      render_target_cache->UseResolveAliasAsCopySource(*alias);
++    }
++    command_processor_.SubmitBarriers(true);
++    for (size_t i = 0; i < stacked_aliases.size(); ++i) {
++      const VulkanRenderTargetCache::ResolveAlias& alias = *stacked_aliases[i];
++      uint32_t row = stacked_rows[i];
++      uint32_t x0 = alias.covered_x0, y0 = alias.covered_y0;
++      uint32_t x1 = std::min({alias.covered_x1, alias.width, width});
++      uint32_t y1 = std::min(alias.covered_y1, alias.height);
++      if (row + y1 > height) {
++        y1 = height > row ? height - row : 0;
++      }
++      if (x0 >= x1 || y0 >= y1) {
++        continue;
++      }
++      VkImageCopy region = {};
++      region.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
++      region.srcSubresource.layerCount = 1;
++      region.srcOffset = {int32_t(x0), int32_t(y0), 0};
++      region.dstSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
++      region.dstSubresource.layerCount = 1;
++      region.dstOffset = {int32_t(x0), int32_t(row + y0), 0};
++      region.extent = {x1 - x0, y1 - y0, 1};
++      command_buffer.CmdVkCopyImage(alias.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
++                                    vulkan_texture.image(), VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
++                                    region);
++      gpu_stats::Add(gpu_stats::kAliasCopies, 1);
++    }
++  }
++
+   return true;
+ }
+ 
+@@ -1857,6 +2273,22 @@ VulkanTextureCache::VulkanTexture::~VulkanTexture() {
    if (image_view_3d_as_2d_signed_ != VK_NULL_HANDLE) {
      dfn.vkDestroyImageView(device, image_view_3d_as_2d_signed_, nullptr);
    }
@@ -12246,7 +12410,7 @@ index ecbd940..c881b65 100644
    vmaDestroyImage(vulkan_texture_cache.vma_allocator_, image_, allocation_);
  }
  
-@@ -1908,6 +2226,15 @@ VkImageView VulkanTextureCache::VulkanTexture::GetView(bool is_signed, uint32_t
+@@ -1908,6 +2340,15 @@ VkImageView VulkanTextureCache::VulkanTexture::GetView(bool is_signed, uint32_t
    VkImageViewCreateInfo view_create_info;
    view_create_info.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
    view_create_info.pNext = nullptr;
@@ -12262,7 +12426,7 @@ index ecbd940..c881b65 100644
    view_create_info.flags = 0;
    view_create_info.image = image();
    view_create_info.format = format;
-@@ -2937,6 +3264,40 @@ bool VulkanTextureCache::Initialize() {
+@@ -2937,6 +3378,40 @@ bool VulkanTextureCache::Initialize() {
            i);
        return false;
      }
@@ -12303,7 +12467,7 @@ index ecbd940..c881b65 100644
      if (IsDrawResolutionScaled()) {
        const std::pair<const uint32_t*, size_t>& current_load_shader_code_scaled =
            load_shader_code_scaled[i];
-@@ -3258,4 +3619,116 @@ xenos::ClampMode VulkanTextureCache::NormalizeClampMode(xenos::ClampMode clamp_m
+@@ -3258,4 +3733,116 @@ xenos::ClampMode VulkanTextureCache::NormalizeClampMode(xenos::ClampMode clamp_m
    return clamp_mode;
  }
  
