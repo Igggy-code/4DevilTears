@@ -31,6 +31,9 @@ public class DevilActivity extends SDLActivity {
     /** Runtime flags (settings menu, later). Implemented in android_touch_gamepad.cpp. */
     static native boolean nativeSetFlag(String name, String value);
     static native String nativeGetFlag(String name);
+    static native void nativeSurfaceState(boolean alive);
+    /** SDL's game surface (for PixelCopy in the flash watcher of the automated tests). */
+    static android.view.SurfaceView gameSurface() { return mSurface; }
 
     /** Read by TouchGamepadView: draw the FPS counter under the overlay toggle. */
     static volatile boolean sShowFps = true;
@@ -44,11 +47,12 @@ public class DevilActivity extends SDLActivity {
      *  third-party captions, e.g. the Russian fan translation). */
     static volatile boolean sSkipIntro = false;
     /** fit | fill | stretch - TouchGamepadView maps touches to game coordinates with it. */
-    static volatile String sScale = "fit";
+    static volatile String sScale = "wide";
 
     // ---- settings (Back button / back gesture, or long press on the overlay toggle) ----
     static final String PREFS = "settings";
-    static final String KEY_SCALE = "scale";            // fit | fill | stretch
+    static final String KEY_SCALE = "scale";            // wide | fit | fill | stretch
+    static final String DEFAULT_SCALE = "wide";
     static final String KEY_SHOW_FPS = "show_fps";
     static final String KEY_SHOW_PAD = "show_pad";
     static final String KEY_CINEMA = "cinema_mode";
@@ -80,9 +84,31 @@ public class DevilActivity extends SDLActivity {
         return Math.max(50, Math.min(100, safe));
     }
 
+    /** Width / height of the screen in landscape. */
+    private double screenAspect() {
+        int w, h;
+        if (android.os.Build.VERSION.SDK_INT >= 30) {
+            // The whole window (the game surface fills it, including under the cutout).
+            android.graphics.Rect r = getWindowManager().getCurrentWindowMetrics().getBounds();
+            w = Math.max(r.width(), r.height()); h = Math.min(r.width(), r.height());
+        } else {
+            DisplayMetrics m = new DisplayMetrics();
+            getWindowManager().getDefaultDisplay().getRealMetrics(m);
+            w = Math.max(m.widthPixels, m.heightPixels); h = Math.min(m.widthPixels, m.heightPixels);
+        }
+        return (w > 0 && h > 0) ? (double) w / h : 16.0 / 9.0;
+    }
+
+    /** "wide": the 16:9 image is stretched to the screen and the game draws narrower to match. */
+    private String wideAspectFlag(String scale) {
+        return "wide".equals(scale) ? String.format(java.util.Locale.ROOT, "%.4f", screenAspect()) : "0";
+    }
+
     private void applyScaleLive(String scale) {
         try {
-            nativeSetFlag("present_letterbox", "stretch".equals(scale) ? "false" : "true");
+            boolean stretched = "stretch".equals(scale) || "wide".equals(scale);
+            nativeSetFlag("present_letterbox", stretched ? "false" : "true");
+            nativeSetFlag("dmc4_wide_aspect", wideAspectFlag(scale));
             nativeSetFlag("present_allow_overscan_cutoff", "fill".equals(scale) ? "true" : "false");
             nativeSetFlag("present_safe_area_y",
                     String.valueOf("fill".equals(scale) ? fillSafeArea() : 90));
@@ -203,11 +229,12 @@ public class DevilActivity extends SDLActivity {
         settingsPanel.addView(displayTitle);
         android.widget.RadioGroup scaleGroup = new android.widget.RadioGroup(this);
         String[][] scales = {
+            { "wide", "Full screen (wider view, no distortion)" },
             { "fit", "Original (16:9, black bars)" },
             { "fill", "Fill screen (crop top and bottom)" },
             { "stretch", "Stretch to screen" },
         };
-        String scale = p.getString(KEY_SCALE, "fit");
+        String scale = p.getString(KEY_SCALE, DEFAULT_SCALE);
         for (int i = 0; i < scales.length; i++) {
             android.widget.RadioButton rb = new android.widget.RadioButton(this);
             rb.setId(1000 + i);
@@ -381,7 +408,7 @@ public class DevilActivity extends SDLActivity {
     }
 
     private File gameDir() {
-        return new File(getFilesDir(), "game");
+        return ImportActivity.gameDir(this);   // internal storage or the app's folder on a memory card
     }
 
     @Override
@@ -403,17 +430,51 @@ public class DevilActivity extends SDLActivity {
             Log.e(TAG, "default.xex not found in " + game.getAbsolutePath());
         }
         Log.i(TAG, "game data dir: " + game.getAbsolutePath());
+        sGameReady = GameBuild.ready(this);
+        if (!sGameReady) {
+            // Opened directly (e.g. by a USB controller) before the game is added / built.
+            startActivity(new android.content.Intent(this, ImportActivity.class));
+            super.onCreate(savedInstanceState);
+            finish();
+            return;
+        }
         super.onCreate(savedInstanceState);
+        // The renderer stops presenting when the app leaves the screen and starts again on the
+        // surface Android creates when it comes back - tell it when the surface exists.
+        if (mSurface != null) {
+            mSurface.getHolder().addCallback(new android.view.SurfaceHolder.Callback() {
+                @Override public void surfaceCreated(android.view.SurfaceHolder holder) {
+                    try { nativeSurfaceState(true); } catch (Throwable t) { }
+                }
+                @Override public void surfaceChanged(android.view.SurfaceHolder holder, int format,
+                                                     int width, int height) { }
+                @Override public void surfaceDestroyed(android.view.SurfaceHolder holder) {
+                    try { nativeSurfaceState(false); } catch (Throwable t) { }
+                }
+            });
+        }
         setRequestedOrientation(ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE);
+        if (android.os.Build.VERSION.SDK_INT >= 28) {
+            // Use the whole screen, also beside the camera hole (the picture is full-screen).
+            android.view.WindowManager.LayoutParams lp = getWindow().getAttributes();
+            lp.layoutInDisplayCutoutMode =
+                    android.view.WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES;
+            getWindow().setAttributes(lp);
+        }
         // On-screen Xbox 360 controller over the game surface (hides itself while a
         // physical controller is connected).
         sShowFps = prefs().getBoolean(KEY_SHOW_FPS, true);
+        // Cinema mode becomes the main mode: switched on once for everyone (also where it had
+        // been turned off before); the switch in the settings still works afterwards.
+        if (!prefs().getBoolean("cinema_default_v2", false)) {
+            prefs().edit().putBoolean(KEY_CINEMA, true).putBoolean("cinema_default_v2", true).apply();
+        }
         sCinemaMode = prefs().getBoolean(KEY_CINEMA, true);
         sPadOpacity = prefs().getInt(KEY_OPACITY, 58) / 100f;
         sFadeIdle = prefs().getBoolean(KEY_FADE_IDLE, true);
         sEssentialOnly = prefs().getBoolean(KEY_ESSENTIAL, false);
         sSkipIntro = prefs().getBoolean(KEY_SKIP_INTRO, editedIntro());
-        sScale = prefs().getString(KEY_SCALE, "fit");
+        sScale = prefs().getString(KEY_SCALE, DEFAULT_SCALE);
         if (mLayout != null) {
             gamepadView = new TouchGamepadView(this);
             gamepadView.setUserHidden(!prefs().getBoolean(KEY_SHOW_PAD, true));
@@ -432,11 +493,35 @@ public class DevilActivity extends SDLActivity {
         setRequestedOrientation(ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE);
     }
 
+    private static boolean sGameReady = false;
+
     @Override
     protected String[] getLibraries() {
         // SDL3 is linked into librexruntime; the last entry is the library
         // whose SDL_main is called (the game code module).
         return new String[] { "c++_shared", "rexruntime", "dmc4" };
+    }
+
+    /**
+     * The game code module is not part of the APK: it is built on the phone from the
+     * player's own default.xex (GameBuild) and loaded from app storage. Developer builds
+     * may still bundle it in the APK.
+     */
+    @Override
+    public void loadLibraries() {
+        System.loadLibrary("c++_shared");
+        System.loadLibrary("rexruntime");
+        if (sGameReady) System.load(GameBuild.libraryPath(this));
+    }
+
+    @Override
+    protected String getMainSharedObject() {
+        return GameBuild.libraryPath(this);
+    }
+
+    @Override
+    protected void main() {
+        if (sGameReady) super.main();
     }
 
     @Override
@@ -479,13 +564,16 @@ public class DevilActivity extends SDLActivity {
         args.add("--gpu_plugin");
         args.add("xenos");
         // Picture scaling chosen in the settings.
-        String scale = prefs().getString(KEY_SCALE, "fit");
-        if ("stretch".equals(scale)) {
+        String scale = prefs().getString(KEY_SCALE, DEFAULT_SCALE);
+        if ("stretch".equals(scale) || "wide".equals(scale)) {
             args.add("--present_letterbox=false");
+            args.add("--dmc4_wide_aspect=" + wideAspectFlag(scale));
         } else if ("fill".equals(scale)) {
             args.add("--present_allow_overscan_cutoff=true");
             args.add("--present_safe_area_y=" + fillSafeArea());
         }
+        // The intro movie is skipped by the app: draw nothing of it meanwhile.
+        if (prefs().getBoolean(KEY_SKIP_INTRO, editedIntro())) args.add("--dmc4_hide_first_movie=true");
         if (prefs().getInt(KEY_FPS_CAP, 0) > 0) args.add("--frame_rate_limit=" + prefs().getInt(KEY_FPS_CAP, 0));
         // Extra flags for experiments without rebuilding: files/args.txt
         File extra = new File(getFilesDir(), "args.txt");

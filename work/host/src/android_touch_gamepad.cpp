@@ -19,6 +19,11 @@
 
 #define LOG_TAG "4DevilTears"
 
+// Surface lifecycle for the presenter (SDK window_sdl.cpp).
+#include <atomic>
+extern std::atomic<bool> g_rex_android_surface_alive;
+extern std::atomic<uint32_t> g_rex_android_surface_generation;
+
 int Dmc4SceneMode();  // dmc4_menu_hooks.cpp
 
 namespace {
@@ -117,6 +122,15 @@ JNIEXPORT jint JNICALL Java_com_fourdeviltears_app_TouchGamepadView_nativeSceneM
   int mode = Dmc4SceneMode();
   if (mode == 0 && rex::kernel::scene::CurrentMode() == 2) mode = 2;
   return mode;
+}
+
+JNIEXPORT void JNICALL Java_com_fourdeviltears_app_DevilActivity_nativeSurfaceState(JNIEnv*, jclass,
+                                                                                   jboolean alive) {
+  if (alive) {
+    g_rex_android_surface_generation.fetch_add(1);
+  }
+  g_rex_android_surface_alive.store(alive != JNI_FALSE);
+  __android_log_print(ANDROID_LOG_INFO, LOG_TAG, "surface %s", alive ? "created" : "destroyed");
 }
 
 // Runtime flags from the Android UI (settings menu, later).

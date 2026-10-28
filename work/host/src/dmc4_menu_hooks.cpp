@@ -8,10 +8,16 @@
 //   byte +23 = screen state (0..10), byte +22 = sub-state.
 // sub_82784BD8 draws a 2D sprite: r5 -> {x, y}, r6 -> {w, h} (1280x720 space).
 #include <atomic>
+#include <dlfcn.h>
 #include <chrono>
 #include <cstdint>
 #include <cstring>
 #include <mutex>
+#include <string>
+#include <unordered_set>
+#include <vector>
+
+#include <rex/cvar.h>
 
 #include <rex/logging.h>
 #include <rex/ppc/context.h>
@@ -20,6 +26,9 @@
 #if defined(__ANDROID__)
 #include <jni.h>
 #endif
+
+REXCVAR_DEFINE_BOOL(dmc4_ui_capture, false, "4DevilTears",
+                    "Log the 2D sprites of every distinct UI screen once (touch layout research)");
 
 namespace {
 std::atomic<int64_t> g_title_seen_ms{0};
@@ -76,8 +85,62 @@ extern "C" void sub_8249D7F8(PPCContext& __restrict ctx, uint8_t* base) {
   g_in_title_draw.store(false);
 }
 
+// ---- UI capture (touch layout research) ------------------------------------------------------
+// With dmc4_ui_capture on, every 2D sprite the game draws is collected; for each distinct UI
+// screen (title state, list menu class, cursor) the sprites of ~0.5 s are logged once as
+// "UISPR" lines: position / size in 1280x720 space, colour, and the call's other arguments.
+// That is the game's own layout - touch areas are built from it, independent of the phone's
+// screen size.
+namespace {
+struct UiSprite {
+  int32_t x, y, w, h;
+  uint32_t color, r3, r4, r8, r9;
+};
+std::mutex g_ui_mutex;
+std::vector<UiSprite> g_ui_sprites;
+uint64_t g_ui_sig = ~0ull;
+int64_t g_ui_sig_since = 0;
+bool g_ui_dumped = true;
+std::unordered_set<uint64_t> g_ui_done;
+}  // namespace
+
+uint64_t Dmc4UiSignature();
+
+void Dmc4UiCaptureSprite(PPCContext& ctx, uint8_t* base) {
+  if (!REXCVAR_GET(dmc4_ui_capture)) return;
+  const uint8_t* pos = base + ctx.r5.u32;
+  const uint8_t* size = base + ctx.r6.u32;
+  UiSprite s{int32_t(Be32(pos)), int32_t(Be32(pos + 4)), int32_t(Be32(size)), int32_t(Be32(size + 4)),
+             ctx.r7.u32 ? Be32(base + ctx.r7.u32) : 0, ctx.r3.u32, ctx.r4.u32, ctx.r8.u32,
+             ctx.r9.u32};
+  const uint64_t sig = Dmc4UiSignature();
+  const int64_t now = NowMs();
+  std::lock_guard<std::mutex> lock(g_ui_mutex);
+  if (sig != g_ui_sig) {
+    g_ui_sig = sig;
+    g_ui_sig_since = now;
+    g_ui_sprites.clear();
+    g_ui_dumped = g_ui_done.count(sig) != 0 || g_ui_done.size() > 300;
+  }
+  if (g_ui_dumped) return;
+  if (now - g_ui_sig_since < 500) {
+    if (g_ui_sprites.size() < 600) g_ui_sprites.push_back(s);
+    return;
+  }
+  g_ui_dumped = true;
+  g_ui_done.insert(sig);
+  REXKRNL_INFO("UISCREEN sig {:016X} ({} sprites in 0.5 s)", sig, g_ui_sprites.size());
+  std::unordered_set<std::string> seen;
+  for (const UiSprite& u : g_ui_sprites) {
+    std::string line = fmt::format("{},{} {}x{} c{:08X} r3 {:08X} r4 {:08X} r8 {} r9 {}", u.x, u.y,
+                                   u.w, u.h, u.color, u.r3, u.r4, u.r8, u.r9);
+    if (seen.insert(line).second) REXKRNL_INFO("UISPR {:016X} {}", sig, line);
+  }
+}
+
 extern "C" void __imp__sub_82784BD8(PPCContext& __restrict ctx, uint8_t* base);
 extern "C" void sub_82784BD8(PPCContext& __restrict ctx, uint8_t* base) {
+  Dmc4UiCaptureSprite(ctx, base);
   if (g_in_title_draw.load() && g_sprite_log_budget.load() > 0) {
     g_sprite_log_budget.fetch_sub(1);
     const uint8_t* pos = base + ctx.r5.u32;
@@ -129,7 +192,9 @@ extern "C" void sub_827B0208(PPCContext& __restrict ctx, uint8_t* base) {
 }
 
 extern "C" void __imp__sub_827B0830(PPCContext& __restrict ctx, uint8_t* base);
+std::atomic<int64_t> g_cock_draw_ms{0};
 extern "C" void sub_827B0830(PPCContext& __restrict ctx, uint8_t* base) {
+  g_cock_draw_ms.store(NowMs());
   g_cock_self.store(ctx.r3.u32);
   g_cock_draw.fetch_add(1);
   CockpitReport(base);
@@ -281,5 +346,103 @@ Java_com_fourdeviltears_app_TouchGamepadView_nativeTitleCursor(JNIEnv*, jclass) 
   uint32_t self = g_title_prev_self;
   if (!base || !self || NowMs() - g_title_seen_ms.load() > 300) return -1;
   return jint(base[self + 291]);
+}
+#endif
+
+#if defined(__ANDROID__)
+// Touch menus: put the cursor straight on the tapped row (the touch layer only does this
+// after it has seen the cursor and the highlighted row agree on this menu).
+extern "C" JNIEXPORT jboolean JNICALL
+Java_com_fourdeviltears_app_TouchGamepadView_nativeSetListCursor(JNIEnv*, jclass, jint value) {
+  uint8_t* base = g_guest_base.load();
+  uint32_t self = g_menu_self.load();
+  if (!base || !self || value < 0 || value > 255 || NowMs() - g_menu_seen_ms.load() > 300) return 0;
+  const uint32_t v = uint32_t(value);
+  uint8_t* p = base + self + 64;
+  p[0] = uint8_t(v >> 24); p[1] = uint8_t(v >> 16); p[2] = uint8_t(v >> 8); p[3] = uint8_t(v);
+  return 1;
+}
+
+extern "C" JNIEXPORT jboolean JNICALL
+Java_com_fourdeviltears_app_TouchGamepadView_nativeSetTitleCursor(JNIEnv*, jclass, jint value) {
+  uint8_t* base = g_guest_base.load();
+  uint32_t self = g_title_prev_self;
+  if (!base || !self || value < 0 || value > 255 || NowMs() - g_title_seen_ms.load() > 300) return 0;
+  base[self + 291] = uint8_t(value);
+  return 1;
+}
+#endif
+
+// Distinct UI screen: title state, list menu class and its cursor, scene mode.
+uint64_t Dmc4UiSignature() {
+  const int64_t now = NowMs();
+  uint64_t title = (now - g_title_seen_ms.load() < 300) ? (0x10000 | g_title_state.load()) : 0;
+  uint64_t menu = (now - g_menu_seen_ms.load() < 300) ? g_menu_vtable.load() : 0;
+  uint64_t cursor = 0xFF;
+  uint8_t* base = g_guest_base.load();
+  if (base && menu && g_menu_self.load()) cursor = Be32(base + g_menu_self.load() + 64) & 0xFF;
+  else if (base && title && g_title_prev_self) cursor = base[g_title_prev_self + 291];
+  return (title << 40) | (menu << 8) | cursor;
+}
+
+// For the GPU-side UI layout capture (renderer, ui_capture_draws): the renderer lives in
+// another shared library, so the signature function is handed over at run time.
+extern "C" uint64_t Dmc4UiSignatureC() { return Dmc4UiSignature(); }
+// A function of the renderer library (librexgpu-xenos.so, loaded by the app with
+// RTLD_LOCAL - so not reachable through RTLD_DEFAULT).
+static void* Dmc4GpuSym(const char* name) {
+  static void* lib = nullptr;
+  if (!lib) lib = dlopen("librexgpu-xenos.so", RTLD_NOW | RTLD_NOLOAD);
+  void* sym = lib ? dlsym(lib, name) : nullptr;
+  return sym ? sym : dlsym(RTLD_DEFAULT, name);
+}
+static void Dmc4RegisterUiSignature() {
+  static std::atomic<bool> done{false};
+  if (done.load()) return;
+  using SetFn = void (*)(uint64_t (*)());
+  if (auto set = reinterpret_cast<SetFn>(Dmc4GpuSym("Rex4dtSetUiSignatureFn"))) {
+    set(&Dmc4UiSignatureC);
+    done.store(true);
+  }
+}
+
+#if defined(__ANDROID__)
+// The gameplay HUD (uCockpit) was drawn in the last 300 ms - the player controls the character.
+extern "C" JNIEXPORT jboolean JNICALL
+Java_com_fourdeviltears_app_TouchGamepadView_nativeHudActive(JNIEnv*, jclass) {
+  Dmc4RegisterUiSignature();
+  return NowMs() - g_cock_draw_ms.load() < 300 ? 1 : 0;
+}
+
+// Write every draw of the next frame to a file (the touch layer asks for it when a tap
+// finds nothing it recognises - to learn that screen).
+extern "C" JNIEXPORT void JNICALL
+Java_com_fourdeviltears_app_TouchGamepadView_nativeUiCaptureFrame(JNIEnv* env, jclass, jstring path) {
+  using Fn = void (*)(const char*);
+  static Fn fn = nullptr;
+  if (!fn) fn = reinterpret_cast<Fn>(Dmc4GpuSym("Rex4dtUiCaptureFrame"));
+  if (!fn || !path) return;
+  const char* p = env->GetStringUTFChars(path, nullptr);
+  if (p) {
+    fn(p);
+    env->ReleaseStringUTFChars(path, p);
+  }
+}
+
+// The UI sprites of the last frame (11 ints each: x0 y0 x1 y1 in 1280x720 game pixels,
+// u0 v0 u1 v1 texture coordinates, texture page, colour, draw), for touch menus.
+extern "C" JNIEXPORT jint JNICALL
+Java_com_fourdeviltears_app_TouchGamepadView_nativeUiSprites(JNIEnv* env, jclass, jintArray out) {
+  using Fn = int (*)(int32_t*, int, uint32_t*);
+  static Fn fn = nullptr;
+  if (!fn) fn = reinterpret_cast<Fn>(Dmc4GpuSym("Rex4dtUiSprites"));
+  if (!fn || !out) return -1;
+  const jsize len = env->GetArrayLength(out);
+  jint* data = env->GetIntArrayElements(out, nullptr);
+  if (!data) return -1;
+  uint32_t frame = 0;
+  const int count = fn(reinterpret_cast<int32_t*>(data), int(len / 11), &frame);
+  env->ReleaseIntArrayElements(out, data, 0);
+  return count;
 }
 #endif
