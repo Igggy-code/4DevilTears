@@ -1000,6 +1000,26 @@ index 0000000..eb94072
 +void InitializeAndroidCore();
 +}  // namespace rex
 +#endif
+diff --git a/include/rex/ppc/function.h b/include/rex/ppc/function.h
+index 611a52f..aeaa88b 100644
+--- a/include/rex/ppc/function.h
++++ b/include/rex/ppc/function.h
+@@ -24,6 +24,7 @@
+ #include <vector>
+ 
+ #include <rex/logging.h>
++#include <rex/thread.h>
+ #include <rex/ppc/context.h>
+ #include <rex/system/kernel_state.h>
+ #include <rex/system/thread_state.h>
+@@ -405,6 +406,7 @@ void _translate_args_to_guest(PPCContext& ctx, uint8_t* base, std::tuple<TArgs..
+ template <auto Func>
+ __attribute__((noinline)) void HostToGuestFunction(PPCContext& ctx, uint8_t* base) {
+   using ret_t = decltype(std::apply(Func, function_args(Func)));
++  rex::thread::HostCodeScope host_code;  // [4DevilTears] no suspension inside host code
+ 
+   auto args = function_args(Func);
+   _translate_args_to_host<Func>(ctx, base, args);
 diff --git a/include/rex/string/numeric.h b/include/rex/string/numeric.h
 index 85994c7..9675532 100644
 --- a/include/rex/string/numeric.h
@@ -1070,6 +1090,30 @@ index 0c39a42..d97adfb 100644
    // Allocates virtual memory from the 'system' heap.
    // System memory is kept separate from game memory but is still accessible
    // using normal guest virtual addresses. Kernel structures and other internal
+diff --git a/include/rex/thread.h b/include/rex/thread.h
+index 30b207d..f507a73 100644
+--- a/include/rex/thread.h
++++ b/include/rex/thread.h
+@@ -108,6 +108,19 @@ void set_current_thread_name(const std::string_view name);
+ // Yields the current thread to the scheduler. Maybe.
+ void MaybeYield();
+ 
++// [4DevilTears] Host (emulator) code entered from guest code: kernel imports, MMIO handlers,
++// memory access callbacks. A thread suspended by the guest (NtSuspendThread) while inside
++// host code could be holding host locks (the global critical region) - suspension is then
++// deferred until it leaves host code, like the Xbox kernel defers it to the end of a call.
++__attribute__((visibility("default"))) void EnterHostCode();
++__attribute__((visibility("default"))) void LeaveHostCode();
++struct HostCodeScope {
++  HostCodeScope() { EnterHostCode(); }
++  ~HostCodeScope() { LeaveHostCode(); }
++  HostCodeScope(const HostCodeScope&) = delete;
++  HostCodeScope& operator=(const HostCodeScope&) = delete;
++};
++
+ // Memory barrier (request - may be ignored).
+ void SyncMemory();
+ 
 diff --git a/include/rex/thread/fiber.h b/include/rex/thread/fiber.h
 index 352af67..7e8491c 100644
 --- a/include/rex/thread/fiber.h
@@ -2222,7 +2266,7 @@ index b52bf39..2cdcd55 100644
  
  namespace rex {
 diff --git a/src/core/threading_posix.cpp b/src/core/threading_posix.cpp
-index 9ac8d15..b6cf80a 100644
+index 9ac8d15..291e77d 100644
 --- a/src/core/threading_posix.cpp
 +++ b/src/core/threading_posix.cpp
 @@ -36,6 +36,7 @@ static_assert(REX_PLATFORM_LINUX || REX_PLATFORM_MAC, "This file is POSIX-only")
@@ -2390,7 +2434,29 @@ index 9ac8d15..b6cf80a 100644
      }
      if (is_current_thread) {
        pthread_exit(reinterpret_cast<void*>(exit_code));
-@@ -1449,6 +1501,7 @@ void* PosixCondition<Thread>::ThreadStartRoutine(void* parameter) {
+@@ -1398,6 +1450,21 @@ class PosixThread : public PosixConditionHandle<Thread> {
+ 
+ thread_local PosixThread* current_thread_ = nullptr;
+ 
++// [4DevilTears] Deferred suspension (see EnterHostCode in rex/thread.h).
++static thread_local int host_code_depth_ = 0;
++static thread_local volatile int suspend_pending_ = 0;
++
++void EnterHostCode() { ++host_code_depth_; }
++
++void LeaveHostCode() {
++  if (--host_code_depth_ > 0) return;
++  host_code_depth_ = 0;
++  while (suspend_pending_ > 0) {
++    suspend_pending_ = suspend_pending_ - 1;
++    if (current_thread_) current_thread_->WaitSuspended();
++  }
++}
++
+ void* PosixCondition<Thread>::ThreadStartRoutine(void* parameter) {
+ #if !REX_PLATFORM_ANDROID
+   if (pthread_setcanceltype(PTHREAD_CANCEL_ASYNCHRONOUS, nullptr) != 0) {
+@@ -1449,6 +1516,7 @@ void* PosixCondition<Thread>::ThreadStartRoutine(void* parameter) {
      thread->handle_.exit_code_ = 0;
      thread->handle_.signaled_ = true;
      thread->handle_.cond_.notify_all();
@@ -2398,6 +2464,32 @@ index 9ac8d15..b6cf80a 100644
    }
  
    current_thread_ = nullptr;
+@@ -1527,6 +1595,11 @@ static void signal_handler(int signal, siginfo_t* /*info*/, void* /*context*/) {
+       if (!current_thread_) {
+         return;
+       }
++      // Inside host code (maybe holding host locks): suspend when it is left.
++      if (host_code_depth_ > 0) {
++        suspend_pending_ = suspend_pending_ + 1;
++        return;
++      }
+       current_thread_->WaitSuspended();
+     } break;
+     case SignalType::kThreadUserCallback: {
+diff --git a/src/core/threading_win.cpp b/src/core/threading_win.cpp
+index 896dfec..19d876f 100644
+--- a/src/core/threading_win.cpp
++++ b/src/core/threading_win.cpp
+@@ -84,6 +84,9 @@ void set_current_thread_name(const std::string_view name) {
+   set_thread_name_impl(GetCurrentThread(), name);
+ }
+ 
++void EnterHostCode() {}
++void LeaveHostCode() {}
++
+ void MaybeYield() {
+   SwitchToThread();
+   MemoryBarrier();
 diff --git a/src/graphics/CMakeLists.txt b/src/graphics/CMakeLists.txt
 index 0d8f8af..775bb46 100644
 --- a/src/graphics/CMakeLists.txt
@@ -14778,12 +14870,14 @@ index 201b623..787e894 100644
    app.set_version_flag("--version", REXGLUE_VERSION_STRING);
    app.require_subcommand(1);
 diff --git a/src/system/mmio_handler.cpp b/src/system/mmio_handler.cpp
-index 2b93005..0a892a5 100644
+index 2b93005..d7dd12e 100644
 --- a/src/system/mmio_handler.cpp
 +++ b/src/system/mmio_handler.cpp
-@@ -10,6 +10,9 @@
+@@ -9,7 +9,11 @@
+  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
   */
  
++#include <rex/thread.h>
  #include <algorithm>
 +#include <atomic>
 +#include <string>
@@ -14791,7 +14885,23 @@ index 2b93005..0a892a5 100644
  #include <cstring>
  #include <utility>
  
-@@ -364,6 +367,52 @@ bool MMIOHandler::TryDecodeLoadStore(const uint8_t* p, DecodedLoadStore& decoded
+@@ -103,6 +107,7 @@ MMIORange* MMIOHandler::LookupRange(uint32_t virtual_address) {
+ }
+ 
+ bool MMIOHandler::CheckLoad(uint32_t virtual_address, uint32_t* out_value) {
++  rex::thread::HostCodeScope host_code;  // [4DevilTears] no suspension inside
+   for (const auto& range : mapped_ranges_) {
+     if ((virtual_address & range.mask) == range.address) {
+       *out_value =
+@@ -114,6 +119,7 @@ bool MMIOHandler::CheckLoad(uint32_t virtual_address, uint32_t* out_value) {
+ }
+ 
+ bool MMIOHandler::CheckStore(uint32_t virtual_address, uint32_t value) {
++  rex::thread::HostCodeScope host_code;  // [4DevilTears] no suspension inside
+   for (const auto& range : mapped_ranges_) {
+     if ((virtual_address & range.mask) == range.address) {
+       range.write(nullptr, range.callback_context, virtual_address, value);
+@@ -364,11 +370,58 @@ bool MMIOHandler::TryDecodeLoadStore(const uint8_t* p, DecodedLoadStore& decoded
  #endif  // REX_ARCH
  }
  
@@ -14844,7 +14954,13 @@ index 2b93005..0a892a5 100644
  bool MMIOHandler::ExceptionCallbackThunk(arch::Exception* ex, void* data) {
    return reinterpret_cast<MMIOHandler*>(data)->ExceptionCallback(ex);
  }
-@@ -402,10 +451,18 @@ bool MMIOHandler::ExceptionCallback(arch::Exception* ex) {
+ 
+ bool MMIOHandler::ExceptionCallback(arch::Exception* ex) {
++  rex::thread::HostCodeScope host_code;  // [4DevilTears] no suspension inside
+   if (ex->code() != arch::Exception::Code::kAccessViolation) {
+     return false;
+   }
+@@ -402,10 +455,18 @@ bool MMIOHandler::ExceptionCallback(arch::Exception* ex) {
      }
    }
    if (!range) {
@@ -14866,7 +14982,7 @@ index 2b93005..0a892a5 100644
      memory::PageAccess cur_access;
      size_t page_length = memory::page_size();
      memory::QueryProtect(fault_host_address, page_length, cur_access);
-@@ -414,11 +471,8 @@ bool MMIOHandler::ExceptionCallback(arch::Exception* ex) {
+@@ -414,11 +475,8 @@ bool MMIOHandler::ExceptionCallback(arch::Exception* ex) {
        // Another thread has cleared this watch. Abort.
        return true;
      }
