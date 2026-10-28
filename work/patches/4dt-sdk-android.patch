@@ -11532,7 +11532,7 @@ index 91ac08f..ee976e5 100644
        }
      }
 diff --git a/src/graphics/vulkan/render_target_cache.cpp b/src/graphics/vulkan/render_target_cache.cpp
-index 0298f06..96371f7 100644
+index 0298f06..4b753dd 100644
 --- a/src/graphics/vulkan/render_target_cache.cpp
 +++ b/src/graphics/vulkan/render_target_cache.cpp
 @@ -10,6 +10,10 @@
@@ -11802,7 +11802,7 @@ index 0298f06..96371f7 100644
 +                    "[4DevilTears] XDK clears: the cleared (1X) render target takes the rows over "
 +                    "without transfers - 0: never (another format's owner -> the clear is drawn), "
 +                    "1: for clears through an MSAA surface (the 4x clear of the 1x scene), 2: all");
-+REXCVAR_DEFINE_BOOL(d3d_clear_hle_msaa_surface, true, "GPU",
++REXCVAR_DEFINE_BOOL(d3d_clear_hle_msaa_surface, false, "GPU",
 +                    "[4DevilTears] XDK clears through an MSAA surface over EDRAM of another "
 +                    "format: host clear of that MSAA render target instead of drawing the clear");
 +// MSAA of the surface of the XDK clear being performed (set by the command processor).
