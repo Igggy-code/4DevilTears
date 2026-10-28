@@ -1327,10 +1327,10 @@ index 7a711a8..d2eec33 100644
    assert_true(clients_[index].driver != NULL);
 diff --git a/src/audio/dmc4_recorder.cpp b/src/audio/dmc4_recorder.cpp
 new file mode 100644
-index 0000000..03d1a1c
+index 0000000..7c44f51
 --- /dev/null
 +++ b/src/audio/dmc4_recorder.cpp
-@@ -0,0 +1,186 @@
+@@ -0,0 +1,209 @@
 +// [4DevilTears] Debug recorder - see rex/audio/dmc4_recorder.h.
 +#include <rex/audio/dmc4_recorder.h>
 +
@@ -1354,16 +1354,44 @@ index 0000000..03d1a1c
 +std::FILE* g_file = nullptr;
 +std::chrono::steady_clock::time_point g_start;
 +
-+struct Wait {
-+  const char* kind;
-+  uint32_t object, type, count, thread_id, entry, lr;
-+  bool infinite;
-+  std::chrono::steady_clock::time_point since;
-+  bool reported;
++// One slot per guest thread, written by the thread itself on every wait (always on, lock
++// free) - so waits that began before recording started are seen too.
++struct Slot {
++  std::atomic<uint32_t> used{0};
++  std::atomic<uint32_t> thread_id{0}, entry{0};
++  std::atomic<int64_t> since_us{0};  // 0 - not waiting
++  std::atomic<int64_t> reported_since{0};
++  std::atomic<uint32_t> object{0}, type{0}, count{0}, lr{0};
++  std::atomic<const char*> kind{nullptr};
++  std::atomic<bool> infinite{false};
++  std::atomic<PPCContext*> ctx{nullptr};
 +};
-+std::mutex g_wait_mutex;
-+std::unordered_map<uint64_t, Wait> g_waits;
-+std::atomic<uint64_t> g_wait_serial{1};
++constexpr int kSlots = 512;
++Slot g_slots[kSlots];
++std::atomic<int> g_slot_next{0};
++thread_local Slot* t_slot = nullptr;
++const auto g_epoch = std::chrono::steady_clock::now();
++
++int64_t NowUs() {
++  return std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() -
++                                                               g_epoch)
++      .count();
++}
++
++Slot* MySlot() {
++  if (t_slot) return t_slot;
++  int i = g_slot_next.fetch_add(1);
++  if (i >= kSlots) return nullptr;
++  Slot* s = &g_slots[i];
++  if (auto* thread = rex::system::XThread::GetCurrentThread()) {
++    s->thread_id = thread->thread_id();
++    s->entry = thread->creation_params()->start_address;
++  }
++  if (auto* ts = rex::runtime::ThreadState::Get()) s->ctx = ts->context();
++  s->used = 1;
++  t_slot = s;
++  return s;
++}
 +
 +std::mutex g_tick_mutex;
 +std::vector<std::pair<TickFn, void*>> g_ticks;
@@ -1393,20 +1421,33 @@ index 0000000..03d1a1c
 +      }
 +      for (auto& [fn, user] : ticks) fn(user);
 +    }
-+    // Guest threads blocked for more than 0.8 s.
++    // Guest threads blocked for more than 0.8 s; every 2 s where every known thread is.
 +    std::vector<std::string> lines;
 +    {
-+      auto now = std::chrono::steady_clock::now();
-+      std::lock_guard<std::mutex> w(g_wait_mutex);
-+      for (auto& [slot, wt] : g_waits) {
-+        auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(now - wt.since).count();
-+        if (ms < 800) continue;
++      const int64_t now = NowUs();
++      const int n = std::min(g_slot_next.load(), kSlots);
++      static int tick = 0;
++      const bool all = (++tick % 4) == 0;
++      std::string threads = "THREADS";
++      for (int i = 0; i < n; ++i) {
++        Slot& s = g_slots[i];
++        if (!s.used) continue;
++        const int64_t since = s.since_us.load();
++        PPCContext* ctx = s.ctx.load();
++        if (all) {
++          threads += fmt::format(" | t{:X} e{:08X} lr{:08X} {}", s.thread_id.load(), s.entry.load(),
++                                 ctx ? uint32_t(ctx->lr) : 0u,
++                                 since ? fmt::format("wait {}ms", (now - since) / 1000) : "run");
++        }
++        if (!since || now - since < 800000) continue;
++        const bool fresh = s.reported_since.exchange(since) != since;
 +        lines.push_back(fmt::format(
 +            "WAIT{} t{:X} entry {:08X} lr {:08X} {} obj {:08X} type {} n{} {}ms{}",
-+            wt.reported ? "" : "-NEW", wt.thread_id, wt.entry, wt.lr, wt.kind, wt.object,
-+            wt.type, wt.count, ms, wt.infinite ? " infinite" : ""));
-+        wt.reported = true;
++            fresh ? "-NEW" : "", s.thread_id.load(), s.entry.load(), s.lr.load(),
++            s.kind.load() ? s.kind.load() : "?", s.object.load(), s.type.load(), s.count.load(),
++            (now - since) / 1000, s.infinite.load() ? " infinite" : ""));
 +      }
++      if (all) lines.push_back(threads);
 +    }
 +    for (auto& l : lines) Line(l);
 +    {
@@ -1434,43 +1475,27 @@ index 0000000..03d1a1c
 +
 +WaitScope::WaitScope(const char* kind, uint32_t object, uint32_t type, uint32_t count,
 +                     bool infinite) {
-+  if (!On()) return;
-+  Wait wt{};
-+  wt.kind = kind;
-+  wt.object = object;
-+  wt.type = type;
-+  wt.count = count;
-+  wt.infinite = infinite;
-+  wt.since = std::chrono::steady_clock::now();
-+  if (auto* thread = rex::system::XThread::GetCurrentThread()) {
-+    wt.thread_id = thread->thread_id();
-+    wt.entry = thread->creation_params()->start_address;
-+  }
-+  if (auto* ts = rex::runtime::ThreadState::Get()) {
-+    if (ts->context()) wt.lr = uint32_t(ts->context()->lr);
-+  }
-+  slot_ = g_wait_serial.fetch_add(1);
-+  std::lock_guard<std::mutex> lock(g_wait_mutex);
-+  g_waits.emplace(slot_, wt);
++  Slot* s = MySlot();
++  if (!s) return;
++  s->kind = kind;
++  s->object = object;
++  s->type = type;
++  s->count = count;
++  s->infinite = infinite;
++  PPCContext* ctx = s->ctx.load();
++  s->lr = ctx ? uint32_t(ctx->lr) : 0u;
++  s->since_us = NowUs();
 +  active_ = true;
++  slot_ = reinterpret_cast<uint64_t>(s);
 +}
 +
 +WaitScope::~WaitScope() {
 +  if (!active_) return;
-+  Wait wt;
-+  {
-+    std::lock_guard<std::mutex> lock(g_wait_mutex);
-+    auto it = g_waits.find(slot_);
-+    if (it == g_waits.end()) return;
-+    wt = it->second;
-+    g_waits.erase(it);
-+  }
-+  if (wt.reported) {
-+    auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-+                  std::chrono::steady_clock::now() - wt.since)
-+                  .count();
-+    Line(fmt::format("WAIT-END t{:X} {} obj {:08X} after {}ms", wt.thread_id, wt.kind, wt.object,
-+                     ms));
++  Slot* s = reinterpret_cast<Slot*>(slot_);
++  const int64_t since = s->since_us.exchange(0);
++  if (On() && since && s->reported_since.load() == since) {
++    Line(fmt::format("WAIT-END t{:X} obj {:08X} after {}ms", s->thread_id.load(), s->object.load(),
++                     (NowUs() - since) / 1000));
 +  }
 +}
 +
@@ -1510,8 +1535,6 @@ index 0000000..03d1a1c
 +    std::fclose(g_file);
 +    g_file = nullptr;
 +  }
-+  std::lock_guard<std::mutex> w(g_wait_mutex);
-+  g_waits.clear();
 +}
 +
 +extern "C" void Rex4dtRecNote(const char* text) {
