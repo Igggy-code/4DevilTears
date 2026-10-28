@@ -11516,7 +11516,7 @@ index 91ac08f..ee976e5 100644
        }
      }
 diff --git a/src/graphics/vulkan/render_target_cache.cpp b/src/graphics/vulkan/render_target_cache.cpp
-index 0298f06..bd1926b 100644
+index 0298f06..646c25e 100644
 --- a/src/graphics/vulkan/render_target_cache.cpp
 +++ b/src/graphics/vulkan/render_target_cache.cpp
 @@ -10,6 +10,10 @@
@@ -11739,7 +11739,7 @@ index 0298f06..bd1926b 100644
      switch (GetPath()) {
        case Path::kHostRenderTargets: {
          Transfer::Rectangle clear_rectangle;
-@@ -1374,9 +1530,204 @@ bool VulkanRenderTargetCache::Resolve(const memory::Memory& memory,
+@@ -1374,9 +1530,227 @@ bool VulkanRenderTargetCache::Resolve(const memory::Memory& memory,
      cleared = true;
    }
  
@@ -11786,6 +11786,9 @@ index 0298f06..bd1926b 100644
 +                    "[4DevilTears] XDK clears: the cleared (1X) render target takes the rows over "
 +                    "without transfers - 0: never (another format's owner -> the clear is drawn), "
 +                    "1: for clears through an MSAA surface (the 4x clear of the 1x scene), 2: all");
++REXCVAR_DEFINE_BOOL(d3d_clear_hle_msaa_surface, true, "GPU",
++                    "[4DevilTears] XDK clears through an MSAA surface over EDRAM of another "
++                    "format: host clear of that MSAA render target instead of drawing the clear");
 +// MSAA of the surface of the XDK clear being performed (set by the command processor).
 +xenos::MsaaSamples g_4dt_hle_clear_msaa = xenos::MsaaSamples::k1X;
 +
@@ -11844,6 +11847,26 @@ index 0298f06..bd1926b 100644
 +        REXGPU_INFO("HLECLEAR other format: {}", what);
 +      }
 +      if (!take_over) {
++        // [4DevilTears] Through an MSAA surface (the 4x clear of the 1x scene): do what the
++        // drawn clear would - its own (MSAA) render target takes the rows over and is
++        // cleared - as a host clear instead of a full-surface draw (~2 ms each on Mali).
++        if (g_4dt_hle_clear_msaa != xenos::MsaaSamples::k1X &&
++            REXCVAR_GET(d3d_clear_hle_msaa_surface)) {
++          RenderTargetKey msaa_key = own_key;
++          msaa_key.msaa_samples = g_4dt_hle_clear_msaa;
++          RenderTarget* msaa_rt =
++              TakeOwnershipWithoutTransfers(msaa_key, start - base_tiles, end - start);
++          if (!msaa_rt) {
++            return false;
++          }
++          ClearRenderTargetTiles(msaa_rt, start, end, own_value);
++          if (!is_depth) {
++            // Transfers out of it into the 1X scene render target become fills.
++            Dmc4RecordUniformClear(base_tiles, pitch_tiles, g_4dt_hle_clear_msaa, is_depth,
++                                   guest_format, first_row, end_row, color, depth, stencil);
++          }
++          return true;
++        }
 +        return false;
 +      }
 +    }
@@ -11944,7 +11967,7 @@ index 0298f06..bd1926b 100644
  bool VulkanRenderTargetCache::Update(bool is_rasterization_done,
                                       reg::RB_DEPTHCONTROL normalized_depth_control,
                                       uint32_t normalized_color_mask, const Shader& vertex_shader) {
-@@ -1397,6 +1748,21 @@ bool VulkanRenderTargetCache::Update(bool is_rasterization_done,
+@@ -1397,6 +1771,21 @@ bool VulkanRenderTargetCache::Update(bool is_rasterization_done,
        RenderTarget* const* depth_and_color_render_targets =
            last_update_accumulated_render_targets();
  
@@ -11966,7 +11989,7 @@ index 0298f06..bd1926b 100644
        PerformTransfersAndResolveClears(1 + xenos::kMaxColorRenderTargets,
                                         depth_and_color_render_targets, last_update_transfers());
  
-@@ -1531,7 +1897,12 @@ void VulkanRenderTargetCache::GetLastUpdateRenderingAttachments(
+@@ -1531,7 +1920,12 @@ void VulkanRenderTargetCache::GetLastUpdateRenderingAttachments(
      depth_attachment->resolveMode = VK_RESOLVE_MODE_NONE;
      depth_attachment->resolveImageView = VK_NULL_HANDLE;
      depth_attachment->resolveImageLayout = VK_IMAGE_LAYOUT_UNDEFINED;
@@ -11980,7 +12003,7 @@ index 0298f06..bd1926b 100644
      depth_attachment->storeOp = VK_ATTACHMENT_STORE_OP_STORE;
      depth_attachment->clearValue = {};
      *stencil_attachment = *depth_attachment;
-@@ -1550,7 +1921,10 @@ void VulkanRenderTargetCache::GetLastUpdateRenderingAttachments(
+@@ -1550,7 +1944,10 @@ void VulkanRenderTargetCache::GetLastUpdateRenderingAttachments(
        color_attachment.resolveMode = VK_RESOLVE_MODE_NONE;
        color_attachment.resolveImageView = VK_NULL_HANDLE;
        color_attachment.resolveImageLayout = VK_IMAGE_LAYOUT_UNDEFINED;
@@ -11992,7 +12015,7 @@ index 0298f06..bd1926b 100644
        color_attachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
        color_attachment.clearValue = {};
        color_attachment_count = i + 1;
-@@ -1880,7 +2254,11 @@ RenderTargetCache::RenderTarget* VulkanRenderTargetCache::CreateRenderTarget(Ren
+@@ -1880,7 +2277,11 @@ RenderTargetCache::RenderTarget* VulkanRenderTargetCache::CreateRenderTarget(Ren
      image_create_info.samples = VkSampleCountFlagBits(uint32_t(1) << uint32_t(key.msaa_samples));
    }
    image_create_info.tiling = VK_IMAGE_TILING_OPTIMAL;
@@ -12005,7 +12028,7 @@ index 0298f06..bd1926b 100644
    image_create_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
    image_create_info.queueFamilyIndexCount = 0;
    image_create_info.pQueueFamilyIndices = nullptr;
-@@ -1901,6 +2279,19 @@ RenderTargetCache::RenderTarget* VulkanRenderTargetCache::CreateRenderTarget(Ren
+@@ -1901,6 +2302,19 @@ RenderTargetCache::RenderTarget* VulkanRenderTargetCache::CreateRenderTarget(Ren
      }
      image_create_info.usage |= VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
    }
@@ -12025,7 +12048,7 @@ index 0298f06..bd1926b 100644
    if (image_create_info.format == VK_FORMAT_UNDEFINED) {
      REXGPU_ERROR("VulkanRenderTargetCache: Unknown {} render target format {}",
                   key.is_depth ? "depth" : "color", static_cast<uint32_t>(key.resource_format));
-@@ -4546,6 +4937,84 @@ VkPipeline const* VulkanRenderTargetCache::GetTransferPipelines(TransferPipeline
+@@ -4546,6 +4960,84 @@ VkPipeline const* VulkanRenderTargetCache::GetTransferPipelines(TransferPipeline
    return transfer_pipelines_.emplace(key, pipelines).first->second.data();
  }
  
@@ -12110,7 +12133,7 @@ index 0298f06..bd1926b 100644
  void VulkanRenderTargetCache::PerformTransfersAndResolveClears(
      uint32_t render_target_count, RenderTarget* const* render_targets,
      const std::vector<Transfer>* render_target_transfers,
-@@ -4558,6 +5027,85 @@ void VulkanRenderTargetCache::PerformTransfersAndResolveClears(
+@@ -4558,6 +5050,85 @@ void VulkanRenderTargetCache::PerformTransfersAndResolveClears(
    DeferredCommandBuffer& command_buffer = command_processor_.deferred_command_buffer();
  
    bool resolve_clear_needed = render_target_resolve_clear_values && resolve_clear_rectangle;
@@ -12196,7 +12219,7 @@ index 0298f06..bd1926b 100644
    VkClearRect resolve_clear_rect;
    if (resolve_clear_needed) {
      // Assuming the rectangle is already clamped by the setup function from the
-@@ -4896,6 +5444,9 @@ void VulkanRenderTargetCache::PerformTransfersAndResolveClears(
+@@ -4896,6 +5467,9 @@ void VulkanRenderTargetCache::PerformTransfersAndResolveClears(
              stencil_clear_rectangle_count += transfer.GetRectangles(
                  dest_rt_key.base_tiles, dest_pitch_tiles, dest_rt_key.msaa_samples, dest_is_64bpp,
                  nullptr, resolve_clear_rectangle);
@@ -12206,7 +12229,7 @@ index 0298f06..bd1926b 100644
            } else {
              if (dest_rt_key.is_depth) {
                if (host_depth_source_vulkan_rt) {
-@@ -4964,8 +5515,32 @@ void VulkanRenderTargetCache::PerformTransfersAndResolveClears(
+@@ -4964,8 +5538,32 @@ void VulkanRenderTargetCache::PerformTransfersAndResolveClears(
  
        // Perform the transfers for the render target.
  
@@ -12239,7 +12262,7 @@ index 0298f06..bd1926b 100644
  
        if (stencil_clear_rectangle_count) {
          VkClearAttachment* stencil_clear_attachment;
-@@ -4995,6 +5570,10 @@ void VulkanRenderTargetCache::PerformTransfersAndResolveClears(
+@@ -4995,6 +5593,10 @@ void VulkanRenderTargetCache::PerformTransfersAndResolveClears(
                  stencil_clear_rectangle.height_pixels * draw_resolution_scale_y();
              stencil_clear_rect_write_ptr->baseArrayLayer = 0;
              stencil_clear_rect_write_ptr->layerCount = 1;
@@ -12250,7 +12273,7 @@ index 0298f06..bd1926b 100644
              ++stencil_clear_rect_write_ptr;
            }
          }
-@@ -5080,6 +5659,11 @@ void VulkanRenderTargetCache::PerformTransfersAndResolveClears(
+@@ -5080,6 +5682,11 @@ void VulkanRenderTargetCache::PerformTransfersAndResolveClears(
            assert_not_zero(transfer_invocation_rectangle_count);
            for (uint32_t j = 0; j < transfer_invocation_rectangle_count; ++j) {
              const Transfer::Rectangle& transfer_rectangle = transfer_invocation_rectangles[j];
@@ -12262,7 +12285,7 @@ index 0298f06..bd1926b 100644
              float transfer_rectangle_x0 = -1.0f + transfer_rectangle.x_pixels * pixels_to_ndc_x;
              float transfer_rectangle_y0 = -1.0f + transfer_rectangle.y_pixels * pixels_to_ndc_y;
              float transfer_rectangle_x1 =
-@@ -5277,8 +5861,14 @@ void VulkanRenderTargetCache::PerformTransfersAndResolveClears(
+@@ -5277,8 +5884,14 @@ void VulkanRenderTargetCache::PerformTransfersAndResolveClears(
  
      // Perform the clear.
      if (resolve_clear_needed) {
@@ -12277,7 +12300,7 @@ index 0298f06..bd1926b 100644
        VkClearAttachment resolve_clear_attachment;
        resolve_clear_attachment.colorAttachment = 0;
        std::memset(&resolve_clear_attachment.clearValue, 0,
-@@ -5402,7 +5992,44 @@ void VulkanRenderTargetCache::PerformTransfersAndResolveClears(
+@@ -5402,7 +6015,44 @@ void VulkanRenderTargetCache::PerformTransfersAndResolveClears(
            } break;
          }
        }
@@ -12322,7 +12345,7 @@ index 0298f06..bd1926b 100644
      }
    }
  }
-@@ -6021,6 +6648,8 @@ bool VulkanRenderTargetCache::TryResolveCopyDirectly(const draw_util::ResolveInf
+@@ -6021,6 +6671,8 @@ bool VulkanRenderTargetCache::TryResolveCopyDirectly(const draw_util::ResolveInf
  
  bool VulkanRenderTargetCache::DumpRenderTargets(uint32_t dump_base, uint32_t dump_row_length_used,
                                                  uint32_t dump_rows, uint32_t dump_pitch) {
