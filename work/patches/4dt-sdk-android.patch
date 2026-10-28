@@ -1327,10 +1327,10 @@ index 7a711a8..d2eec33 100644
    assert_true(clients_[index].driver != NULL);
 diff --git a/src/audio/dmc4_recorder.cpp b/src/audio/dmc4_recorder.cpp
 new file mode 100644
-index 0000000..7c44f51
+index 0000000..865b684
 --- /dev/null
 +++ b/src/audio/dmc4_recorder.cpp
-@@ -0,0 +1,209 @@
+@@ -0,0 +1,325 @@
 +// [4DevilTears] Debug recorder - see rex/audio/dmc4_recorder.h.
 +#include <rex/audio/dmc4_recorder.h>
 +
@@ -1338,10 +1338,20 @@ index 0000000..7c44f51
 +#include <chrono>
 +#include <condition_variable>
 +#include <cstdio>
++#include <cstring>
 +#include <mutex>
 +#include <thread>
 +#include <unordered_map>
 +#include <vector>
++
++#if defined(__linux__) || defined(__ANDROID__)
++#include <dlfcn.h>
++#include <signal.h>
++#include <sys/syscall.h>
++#include <ucontext.h>
++#include <unistd.h>
++#define DMC4REC_SAMPLER 1
++#endif
 +
 +#include <rex/system/thread_state.h>
 +#include <rex/system/xthread.h>
@@ -1365,6 +1375,10 @@ index 0000000..7c44f51
 +  std::atomic<const char*> kind{nullptr};
 +  std::atomic<bool> infinite{false};
 +  std::atomic<PPCContext*> ctx{nullptr};
++  std::atomic<int> host_tid{0};
++  // Host stack sample (signal handler): pc, lr and a few frame-pointer return addresses.
++  std::atomic<uint32_t> sample_serial{0};
++  uintptr_t sample[8] = {};
 +};
 +constexpr int kSlots = 512;
 +Slot g_slots[kSlots];
@@ -1388,6 +1402,9 @@ index 0000000..7c44f51
 +    s->entry = thread->creation_params()->start_address;
 +  }
 +  if (auto* ts = rex::runtime::ThreadState::Get()) s->ctx = ts->context();
++#if DMC4REC_SAMPLER
++  s->host_tid = int(syscall(SYS_gettid));
++#endif
 +  s->used = 1;
 +  t_slot = s;
 +  return s;
@@ -1406,6 +1423,99 @@ index 0000000..7c44f51
 +                                                               g_start)
 +      .count();
 +}
++
++#if DMC4REC_SAMPLER
++// Where a running (not waiting) thread really is: a real-time signal makes it record its
++// own registers; the recompiled game functions are named sub_<guest address> in the
++// symbol table, so dladdr turns host addresses into guest functions.
++int SampleSignal() { return SIGRTMIN + 10; }
++
++void SampleHandler(int, siginfo_t*, void* context) {
++  const int tid = int(syscall(SYS_gettid));
++  const int n = std::min(g_slot_next.load(), kSlots);
++  for (int i = 0; i < n; ++i) {
++    Slot& s = g_slots[i];
++    if (s.host_tid.load() != tid) continue;
++    auto* uc = static_cast<ucontext_t*>(context);
++#if defined(__aarch64__)
++    s.sample[0] = uc->uc_mcontext.pc;
++    s.sample[1] = uc->uc_mcontext.regs[30];
++    uintptr_t fp = uc->uc_mcontext.regs[29];
++#elif defined(__x86_64__)
++    s.sample[0] = uc->uc_mcontext.gregs[REG_RIP];
++    s.sample[1] = 0;
++    uintptr_t fp = uc->uc_mcontext.gregs[REG_RBP];
++#else
++    uintptr_t fp = 0;
++#endif
++    for (int k = 2; k < 8; ++k) {
++      if (!fp || (fp & 7)) {
++        s.sample[k] = 0;
++        continue;
++      }
++      const uintptr_t* frame = reinterpret_cast<const uintptr_t*>(fp);
++      s.sample[k] = frame[1];
++      const uintptr_t next = frame[0];
++      fp = next > fp && next - fp < (1u << 20) ? next : 0;
++    }
++    s.sample_serial.fetch_add(1);
++    return;
++  }
++}
++
++void InstallSampler() {
++  static bool installed = false;
++  if (installed) return;
++  installed = true;
++  struct sigaction sa = {};
++  sa.sa_sigaction = SampleHandler;
++  sa.sa_flags = SA_SIGINFO | SA_RESTART;
++  sigemptyset(&sa.sa_mask);
++  sigaction(SampleSignal(), &sa, nullptr);
++}
++
++std::string Symbolize(uintptr_t addr) {
++  if (!addr) return "-";
++  Dl_info info = {};
++  if (dladdr(reinterpret_cast<void*>(addr), &info) && info.dli_sname) {
++    return fmt::format("{}+{:X}", info.dli_sname, addr - uintptr_t(info.dli_saddr));
++  }
++  if (info.dli_fname) {
++    const char* base = std::strrchr(info.dli_fname, '/');
++    return fmt::format("{}+{:X}", base ? base + 1 : info.dli_fname, addr - uintptr_t(info.dli_fbase));
++  }
++  return fmt::format("{:X}", addr);
++}
++
++// Samples every thread that is not inside a guest wait and logs where it is.
++void SampleRunningThreads(std::vector<std::string>& lines) {
++  InstallSampler();
++  const int64_t now = NowUs();
++  const int n = std::min(g_slot_next.load(), kSlots);
++  std::vector<std::pair<int, uint32_t>> sent;
++  for (int i = 0; i < n; ++i) {
++    Slot& s = g_slots[i];
++    if (!s.used || !s.host_tid.load()) continue;
++    const int64_t since = s.since_us.load();
++    if (since && now - since > 800000) continue;  // reported as WAIT already
++    sent.emplace_back(i, s.sample_serial.load());
++    syscall(SYS_tgkill, getpid(), s.host_tid.load(), SampleSignal());
++  }
++  std::this_thread::sleep_for(std::chrono::milliseconds(30));
++  for (auto& [i, serial] : sent) {
++    Slot& s = g_slots[i];
++    if (s.sample_serial.load() == serial) {
++      lines.push_back(fmt::format("RUN t{:X} entry {:08X} (no sample)", s.thread_id.load(),
++                                  s.entry.load()));
++      continue;
++    }
++    std::string l = fmt::format("RUN t{:X} entry {:08X} pc {} lr {} |", s.thread_id.load(),
++                                s.entry.load(), Symbolize(s.sample[0]), Symbolize(s.sample[1]));
++    for (int k = 2; k < 8 && s.sample[k]; ++k) l += " " + Symbolize(s.sample[k]);
++    lines.push_back(l);
++  }
++}
++#endif
 +
 +void WatchdogMain() {
 +  std::unique_lock<std::mutex> lock(g_watch_mutex);
@@ -1449,6 +1559,12 @@ index 0000000..7c44f51
 +      }
 +      if (all) lines.push_back(threads);
 +    }
++#if DMC4REC_SAMPLER
++    {
++      static int sample_tick = 0;
++      if ((++sample_tick % 2) == 0) SampleRunningThreads(lines);
++    }
++#endif
 +    for (auto& l : lines) Line(l);
 +    {
 +      std::lock_guard<std::mutex> f(g_file_mutex);
