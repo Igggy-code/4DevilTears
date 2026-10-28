@@ -1,0 +1,5 @@
+# v69 + v70 вместе (A) против обоих выключенных (B), A B B A.
+gp_newA    | @gameplay
+gp_oldB    | @gameplay --fast_resolve_overlap_on_memory_reads_only=false --vulkan_pass_area_viewport=false
+gp_oldB2   | @gameplay --fast_resolve_overlap_on_memory_reads_only=false --vulkan_pass_area_viewport=false
+gp_newA2   | @gameplay

@@ -1,0 +1,3 @@
+# v99 (стабилизация): 1) по умолчанию 2) очистка через MSAA отрисовкой, как раньше
+gp_v99      | @gameplay
+gp_drawclr  | @gameplay --d3d_clear_hle_msaa_surface=false

@@ -1,0 +1,5 @@
+# Проверка без влияния порядка: A B B A (сон / пустой цикл / пустой цикл / сон). ~14 мин.
+gp_sleepA  | @gameplay
+gp_spinB   | @gameplay --dmc4_spin_sleep_us=0
+gp_spinB2  | @gameplay --dmc4_spin_sleep_us=0
+gp_sleepA2 | @gameplay

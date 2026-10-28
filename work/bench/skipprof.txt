@@ -1,0 +1,4 @@
+# То же + профиль проходов GPU (~9 мин).
+gp_new     | @gameplay
+gp_noskip  | @gameplay --rt_skip_transfers_before_overwrite=false
+gp_profile | @gameplay --gpu_profile=true

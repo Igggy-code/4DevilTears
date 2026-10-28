@@ -1,0 +1,3 @@
+# Копии кадра, сложенные в одну высокую текстуру (bloom), собираются на GPU (v80) вкл / выкл.
+gp_stack   | @gameplay
+gp_nostack | @gameplay --fast_resolve_stacked=false

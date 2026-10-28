@@ -1,0 +1,6 @@
+# Поиск зелёной вспышки в начале первого ролика: 1) по умолчанию 2) без замены переносов очисткой 3) без прямой записи 4) без обоих 5) без упрощённых очисток
+gp_1def    | @gameplay
+gp_2nofill | @gameplay --rt_uniform_clear_fill=false
+gp_3nozc   | @gameplay --fast_resolve_zero_copy=false
+gp_4none   | @gameplay --rt_uniform_clear_fill=false --fast_resolve_zero_copy=false
+gp_5nohle  | @gameplay --d3d_clear_hle=false

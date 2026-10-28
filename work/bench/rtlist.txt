@@ -1,0 +1,3 @@
+# Со списком форматов рендер-таргетов (сжатие кадра на Mali) / без. В первом запуске — сравнение на ходу (live1).
+gp_list    | @gameplay
+gp_nolist  | @gameplay --vulkan_rt_format_list=false

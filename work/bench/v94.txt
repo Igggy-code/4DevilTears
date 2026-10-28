@@ -1,0 +1,3 @@
+# v94: 1) по умолчанию (сцена за один проход — теперь должна включаться) 2) полосами, как раньше
+gp_v94      | @gameplay
+gp_bands    | @gameplay --collapse_predicated_tiling=false

@@ -1,0 +1,4 @@
+# Зелёная вспышка в начале первого ролика: по умолчанию / без замены переносов очисткой / без прямой записи
+gp_def     | @gameplay
+gp_nofill  | @gameplay --rt_uniform_clear_fill=false
+gp_nozc    | @gameplay --fast_resolve_zero_copy=false

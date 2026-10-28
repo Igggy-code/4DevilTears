@@ -1,0 +1,3 @@
+# v81: zero-copy и для k_8_8_8_8 (bloom и др.) вкл / выкл; сборка bloom-текстуры на GPU включена в обоих.
+gp_zc8     | @gameplay
+gp_nozc8   | @gameplay --fast_resolve_zero_copy_snorm=false

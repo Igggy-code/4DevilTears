@@ -1,0 +1,4 @@
+# v83: 1) всё по умолчанию (сборка bloom выкл); 2) очистки без передачи владения; 3) сборка bloom вкл — для поиска мигания
+gp_own     | @gameplay
+gp_noown   | @gameplay --d3d_clear_hle_take_ownership=false
+gp_stack   | @gameplay --fast_resolve_stacked=true

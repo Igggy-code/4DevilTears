@@ -1,0 +1,4 @@
+# Сколько спать в ожидании видеочипа: 100 мкс (по умолчанию) / 30 / 300. ~9 мин.
+gp_new     | @gameplay
+gp_s30     | @gameplay --dmc4_spin_sleep_us=30
+gp_s300    | @gameplay --dmc4_spin_sleep_us=300

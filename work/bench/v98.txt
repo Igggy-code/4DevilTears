@@ -1,0 +1,3 @@
+# v98: 1) по умолчанию (очистка через MSAA — хост-очистка вместо отрисовки) + профиль GPU 2) как раньше (очистка рисуется) + профиль GPU
+gp_v98      | @gameplay --gpu_profile=true
+gp_drawclr  | @gameplay --gpu_profile=true --d3d_clear_hle_msaa_surface=false

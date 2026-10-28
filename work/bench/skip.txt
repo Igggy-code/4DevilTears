@@ -1,0 +1,3 @@
+# Без переносов в рендер-таргеты, которые тут же целиком очищаются (A/B), ~6 мин.
+gp_new     | @gameplay
+gp_noskip  | @gameplay --rt_skip_transfers_before_overwrite=false

@@ -1,0 +1,4 @@
+# v76: опрос WAIT_REG_MEM короткими снами (100 мкс) против целых миллисекунд (0).
+wait100  | --gpu_wait_sleep_us=100
+wait0    | --gpu_wait_sleep_us=0
+wait30   | --gpu_wait_sleep_us=30

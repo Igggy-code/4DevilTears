@@ -1,0 +1,3 @@
+# Переносы в буфер глубины: stencil 8 проходами (как сейчас) против очистки в 0 (A/B, ~6 мин).
+gp_new     | @gameplay
+gp_nost    | @gameplay --vulkan_transfer_stencil_bits=false

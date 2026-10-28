@@ -1,0 +1,3 @@
+# Очистки XDK как очистки Vulkan (HLE) вкл/выкл. Скриншот каждого варианта — проверить полосы.
+hle      | --d3d_clear_hle=true
+nohle    | --d3d_clear_hle=false

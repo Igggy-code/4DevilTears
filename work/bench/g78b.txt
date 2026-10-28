@@ -1,0 +1,8 @@
+# Pixel 6 (Mali-G78), шаг 2: полоса уходит без расчёта границ на процессоре (cpu_vs_off),
+# но это -8 FPS. Ищем точную причину: быстрые копирования кадра (fast_resolve) и прямые resolve.
+base         | --anisotropic_override=-1
+base_again   | --anisotropic_override=-1
+fast_off     | --fast_resolve=0
+fast_both    | --fast_resolve=1
+direct_off   | --direct_host_resolve=false
+cpu_vs_off   | --execute_unclipped_draw_vs_on_cpu=false

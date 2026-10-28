@@ -1,0 +1,5 @@
+# Быстрый resolve при перекрытии: сохранять быстрый путь (A) против старого поведения (B), A B B A. ~14 мин.
+gp_dualA   | @gameplay
+gp_nodualB | @gameplay --fast_resolve_overlap_dual=false
+gp_nodualB2| @gameplay --fast_resolve_overlap_dual=false
+gp_dualA2  | @gameplay

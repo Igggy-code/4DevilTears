@@ -1,0 +1,3 @@
+# v84: всё по умолчанию (прямая запись во все текстуры адреса, очистки как в v79) / без прямой записи
+gp_v84     | @gameplay
+gp_nozc    | @gameplay --fast_resolve_zero_copy=false

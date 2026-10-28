@@ -14,6 +14,7 @@
 #                                                                   в меню снимается FPS/плавность + скриншот, в конце таблица
 #                                                                   (~1,5 мин на вариант; телефон не трогать, экран не гасить)
 #   BENCH_SET=имя — свой набор вариантов из work/bench/<имя>.txt (по умолчанию work/bench/default.txt)
+#   PHONE=p6|p8  — если подключено несколько телефонов (логи: android_p6_*, bench_*_p6, trace_*_p6)
 #   ARGS="--a=1 --b" bash ".../install_android.sh"                  флаги без пересборки (ARGS=none — убрать) + перезапуск
 #
 # Файлы игры (default.xex + nativeXenon/) кладутся во внутреннюю память приложения
@@ -25,11 +26,50 @@ APK="$ROOT/DMC4.apk"
 PKG=com.fourdeviltears.app
 ACT="$PKG/.DevilActivity"
 mkdir -p "$WORK/logs"
+# Автоочистка логов: последние LOGS_KEEP (по умолчанию 6) прогонов автостенда и трасс
+# хранятся целиком, у более старых удаляются тяжёлые файлы (дампы текстур/шейдеров, видео,
+# промежуточные скриншоты) - таблицы, логи и итоговые снимки остаются.
+prune_logs() {
+  local keep="${LOGS_KEEP:-6}" kind d f
+  for kind in bench trace; do
+    ls -1td "$WORK/logs/${kind}_"* 2>/dev/null | tail -n +"$((keep + 1))" | while read -r d; do
+      for f in "$d"/textures.tar "$d"/shaders.tar "$d"/*.mp4 "$d"/*-boot_*.png "$d"/*-game_*.png \
+               "$d"/*-menu_*.png "$d"/*-shot_*.png "$d"/*-skip_*.png; do
+        [ -f "$f" ] && rm -f "$f"
+      done
+    done
+  done
+  rm -f "$WORK/logs/textures_trace.tar" "$WORK/logs/shaders.tar"
+  local free_kb; free_kb="$(df -k "$WORK" | tail -1 | awk '{print $4}')"
+  [ "${free_kb:-0}" -lt 3000000 ] && echo "!!! на диске меньше 3 ГБ свободно ($((free_kb / 1024)) МБ)"
+}
+prune_logs
 ANDROID_HOME=""
 [ -f "$ROOT/build/android-app/local.properties" ] && ANDROID_HOME="$(sed -n 's/^sdk.dir=//p' "$ROOT/build/android-app/local.properties")"
 ADB="$ANDROID_HOME/platform-tools/adb"
 [ -x "$ADB" ] || ADB="$(command -v adb)"
 [ -x "$ADB" ] || { echo "Нет adb (Android Studio -> SDK Tools -> Platform-Tools)"; exit 1; }
+# Несколько телефонов по USB: PHONE=p6 / PHONE=p8 (или точное название модели) выбирает,
+# с каким работать; логи, автотесты и трассы тогда подписываются _p6 / _p8.
+"$ADB" start-server >/dev/null 2>&1
+LOGTAG=""
+if [ -n "${PHONE:-}" ]; then LOGTAG="_$(echo "$PHONE" | tr 'A-Z ' 'a-z_')"; fi
+if [ -z "${ANDROID_SERIAL:-}" ]; then
+  DEVS="$("$ADB" devices | awk 'NR>1 && $2=="device" {print $1}')"
+  if [ "$(echo "$DEVS" | grep -c .)" -gt 1 ]; then
+    WANT="${PHONE:-}"
+    case "$WANT" in p6|P6) WANT="Pixel 6";; p8|P8) WANT="Pixel 8";; esac
+    if [ -z "$WANT" ]; then
+      echo "Подключено несколько телефонов - укажите PHONE=p6 или PHONE=p8:"
+      for s in $DEVS; do echo "  $s  $("$ADB" -s "$s" shell getprop ro.product.model | tr -d '\r')"; done
+      exit 1
+    fi
+    for s in $DEVS; do
+      [ "$("$ADB" -s "$s" shell getprop ro.product.model | tr -d '\r')" = "$WANT" ] && export ANDROID_SERIAL="$s"
+    done
+    [ -n "${ANDROID_SERIAL:-}" ] || { echo "Не найден телефон «$WANT» (adb devices)"; exit 1; }
+  fi
+fi
 if ! "$ADB" get-state >/dev/null 2>&1; then
   echo "телефон не виден — перезапускаю adb..."
   "$ADB" kill-server >/dev/null 2>&1; "$ADB" start-server >/dev/null 2>&1
@@ -39,36 +79,59 @@ fi
 echo "Телефон: $("$ADB" shell getprop ro.product.model) / Android $("$ADB" shell getprop ro.build.version.release)"
 
 collect_logs() {
-  "$ADB" exec-out screencap -p > "$WORK/logs/android_screen.png" 2>/dev/null
-  "$ADB" logcat -d > "$WORK/logs/android_logcat.txt"
+  "$ADB" exec-out screencap -p > "$WORK/logs/android${LOGTAG}_screen.png" 2>/dev/null
+  "$ADB" logcat -d > "$WORK/logs/android${LOGTAG}_logcat.txt"
   # лог рантайма: ищем самый свежий .log в файлах приложения
-  "$ADB" exec-out run-as $PKG cat files/dmc4.log > "$WORK/logs/android_dmc4.log" 2>/dev/null
-  "$ADB" exec-out run-as $PKG cat files/perf.csv > "$WORK/logs/android_perf.csv" 2>/dev/null
+  "$ADB" exec-out run-as $PKG cat files/dmc4.log > "$WORK/logs/android${LOGTAG}_dmc4.log" 2>/dev/null
+  "$ADB" exec-out run-as $PKG cat files/perf.csv > "$WORK/logs/android${LOGTAG}_perf.csv" 2>/dev/null
+  # Сборка кода игры на телефоне (ошибки компилятора/линкера).
+  "$ADB" exec-out run-as $PKG cat files/build/build.log > "$WORK/logs/android${LOGTAG}_build_on_phone.log" 2>/dev/null
   # Дамп шейдеров (если игра запускалась с ARGS="--dump_shaders=...files/shaders").
   if "$ADB" shell run-as $PKG ls files/shaders >/dev/null 2>&1; then
     "$ADB" exec-out run-as $PKG tar -cf - files/shaders > "$WORK/logs/shaders.tar" 2>/dev/null
     echo "шейдеров в дампе: $(tar -tf "$WORK/logs/shaders.tar" 2>/dev/null | grep -c .)"
   fi
-  "$ADB" shell dumpsys thermalservice > "$WORK/logs/android_thermal.txt" 2>/dev/null
+  "$ADB" shell dumpsys thermalservice > "$WORK/logs/android${LOGTAG}_thermal.txt" 2>/dev/null
   # Сводка по последним ~600 кадрам: FPS, время кадра, отрисовки, простои.
-  if [ -s "$WORK/logs/android_perf.csv" ]; then
-    tail -n 600 "$WORK/logs/android_perf.csv" | awk -F, '
+  if [ -s "$WORK/logs/android${LOGTAG}_perf.csv" ]; then
+    tail -n 600 "$WORK/logs/android${LOGTAG}_perf.csv" | awk -F, '
       NR==1 && $1 ~ /frame_time_us/ { next }
       $1 > 0 { n++; t += $1; d += $3; st += $4; if ($1 > mx) mx = $1; if ($1 > 50000) slow++ }
       END { if (n) printf "кадров %d: в среднем %.1f FPS (%.1f мс), худший %.1f мс, кадров >50 мс: %d, отрисовок/кадр %.0f, простоев/кадр %.2f\n",
-            n, 1e6 / (t / n), t / n / 1000, mx / 1000, slow, d / n, st / n }' | tee "$WORK/logs/android_perf_summary.txt"
+            n, 1e6 / (t / n), t / n / 1000, mx / 1000, slow, d / n, st / n }' | tee "$WORK/logs/android${LOGTAG}_perf_summary.txt"
   fi
-  grep -m1 "Thermal Status" "$WORK/logs/android_thermal.txt" 2>/dev/null
-  grep -E "4DevilTears|rex|DEBUG|FATAL|crash|SIGSEGV|SIGBUS|SIGABRT|backtrace|#[0-9]+ pc" "$WORK/logs/android_logcat.txt" | tail -60 > "$WORK/logs/android_logcat_short.txt"
+  grep -m1 "Thermal Status" "$WORK/logs/android${LOGTAG}_thermal.txt" 2>/dev/null
+  grep -E "4DevilTears|rex|DEBUG|FATAL|crash|SIGSEGV|SIGBUS|SIGABRT|backtrace|#[0-9]+ pc" "$WORK/logs/android${LOGTAG}_logcat.txt" | tail -60 > "$WORK/logs/android${LOGTAG}_logcat_short.txt"
   ls -la "$WORK/logs"/android_*
 }
 
 if [ "${LOGS:-0}" = "1" ]; then collect_logs; echo "LOGS_DONE"; exit 0; fi
+if [ "${SHOT:-0}" = "1" ]; then
+  # Снимок текущего экрана телефона + запись того, что игра рисует в этом кадре.
+  OUTD="$WORK/logs/shots"; mkdir -p "$OUTD"; T="$(date +%H%M%S)"
+  "$ADB" shell run-as $PKG touch files/ui_capture_now
+  "$ADB" exec-out screencap -p > "$OUTD/shot_$T.png"
+  sleep 2
+  echo "SHOT_DONE $OUTD/shot_$T.png"; exit 0
+fi
+if [ "${UI_PULL:-0}" = "1" ]; then
+  OUTD="$WORK/logs/ui_pull_$(date +%m%d_%H%M)${LOGTAG}"; mkdir -p "$OUTD"
+  "$ADB" shell run-as $PKG ls -la files > "$OUTD/files.txt" 2>&1
+  "$ADB" exec-out run-as $PKG sh -c "'cd files && ls ui_*.png 2>/dev/null | xargs tar -cf -'" | tar -xf - -C "$OUTD" 2>/dev/null
+  "$ADB" exec-out run-as $PKG cat files/dmc4.log > "$OUTD/dmc4.log" 2>/dev/null
+  "$ADB" exec-out run-as $PKG cat files/dmc4.1.log > "$OUTD/dmc4.1.log" 2>/dev/null
+  "$ADB" exec-out run-as $PKG cat files/args.txt > "$OUTD/args.txt" 2>/dev/null
+  "$ADB" exec-out run-as $PKG cat files/ui_taps.txt > "$OUTD/ui_taps.txt" 2>/dev/null
+  "$ADB" exec-out run-as $PKG cat files/ui_frames.txt > "$OUTD/ui_frames.txt" 2>/dev/null
+  "$ADB" shell run-as $PKG rm -f files/ui_frames.txt files/ui_taps.txt
+  "$ADB" logcat -d -s 4DevilTearsTouch:I 4DevilTears:I 4DevilTearsUi:I > "$OUTD/logcat.txt" 2>/dev/null
+  echo "UI_PULL_DONE $OUTD"; exit 0
+fi
 
 if [ "${PROFILE:-0}" = "1" ]; then
   PID="$("$ADB" shell pidof $PKG | tr -d '\r')"
   [ -n "$PID" ] || { echo "Игра не запущена"; exit 1; }
-  OUT="$WORK/logs/android_profile.txt"
+  OUT="$WORK/logs/android${LOGTAG}_profile.txt"
   "$ADB" shell setprop security.perf_harden 0
   "$ADB" shell rm -f /data/local/tmp/perf.data
   echo "== simpleperf 10 с (pid $PID) — не трогай телефон"
@@ -122,12 +185,14 @@ skin_temp() {
 
 if [ "${BENCH:-0}" = "1" ]; then
   # Ctrl+C / any exit: stop the background gameplay input loop.
-  trap 'rm -f "$WORK"/logs/bench_*/.inputs 2>/dev/null; kill $(jobs -p) 2>/dev/null' EXIT INT TERM
+  # Only this run's own marker: another phone's bench may be running at the same time.
+  trap 'rm -f "${OUTD:-/nonexistent}/.inputs" 2>/dev/null; kill $(jobs -p) 2>/dev/null' EXIT
+  trap 'exit 130' INT TERM   # Ctrl+C stops the bench (the EXIT trap above cleans up)
   SET="$WORK/bench/${BENCH_SET:-default}.txt"
   [ -f "$SET" ] || { echo "нет $SET"; exit 1; }
   echo "== установка APK"; "$ADB" install -r "$APK" || exit 1
   WARM="${BENCH_WARM:-55}"; MEASURE="${BENCH_MEASURE:-15}"
-  OUTD="$WORK/logs/bench_$(date +%m%d_%H%M)"; mkdir -p "$OUTD"
+  OUTD="$WORK/logs/bench_$(date +%m%d_%H%M)${LOGTAG}"; mkdir -p "$OUTD"
   "$ADB" shell settings put system screen_off_timeout 1800000 >/dev/null 2>&1
   COOL="${BENCH_COOL_TEMP:-37}"; COOL_MAX="${BENCH_COOL_MAX:-60}"
   printf "%-18s %6s %7s %6s %6s %7s %6s %9s %s\n" "вариант" "FPS" "медиана" "≤17мс" "≤34мс" "p95,мс" ">50мс" "t°C→t°C" "флаги" | tee "$OUTD/summary.txt"
@@ -169,6 +234,10 @@ if [ "${BENCH:-0}" = "1" ]; then
     if [ -n "$FLAGS" ]; then printf '%s\n' $FLAGS | "$ADB" exec-in run-as $PKG sh -c 'cat > files/args.txt'
     else "$ADB" shell run-as $PKG rm -f files/args.txt; fi
     "$ADB" shell run-as $PKG rm -f files/perf.csv files/state.txt
+    # BENCH_FLASH=1: приложение само ловит короткие цветные вспышки (PixelCopy ~15 раз в секунду)
+    # от ухода с титула до 5 с первого ролика и сохраняет кадры files/flash_*.png.
+    "$ADB" shell run-as $PKG sh -c "'rm -f files/flash_*'"
+    [ "${BENCH_FLASH:-0}" = "1" ] && "$ADB" shell run-as $PKG touch files/flash_watch
     "$ADB" shell am start -n "$ACT" >/dev/null
     # Пропустить заставки и вступительный ролик: пока игра рисует мало (логотипы, видео —
     # единицы draw-вызовов на кадр), нажимаем START на экранном геймпаде каждые 3 с.
@@ -224,15 +293,20 @@ if [ "${BENCH:-0}" = "1" ]; then
       done
       echo "  $NAME: титул пройден ($(st))"
       REC_PID=""
-      if [ "${BENCH_RECORD:-0}" = "1" ] && [ "$n" = "1" ]; then
+      if { [ "${BENCH_RECORD:-0}" = "1" ] && [ "$n" = "1" ]; } || [ "${BENCH_RECORD:-0}" = "all" ]; then
         "$ADB" shell rm -f /sdcard/4dt_game.mp4
-        "$ADB" shell screenrecord --time-limit "${BENCH_GAME_WAIT:-45}" --bit-rate 12000000 /sdcard/4dt_game.mp4 &
+        # BENCH_RECORD_SECS: длина записи с момента ухода с титула (загрузка + первый ролик).
+        "$ADB" shell screenrecord --time-limit "${BENCH_RECORD_SECS:-${BENCH_GAME_WAIT:-25}}" --bit-rate 8000000 /sdcard/4dt_game.mp4 &
         REC_PID=$!
       fi
       if [ "$GAMEPLAY" = "1" ]; then
         # 1st cutscene (Kyrie): skip it a few seconds after it starts.
         wait_for 90 '[ "$(echo "$S" | sed -n "s/.*cutscenes=\([0-9]*\).*/\1/p")" -ge 1 ]'
-        sleep 4
+        # Серия снимков сразу после начала ролика (короткие вспышки / рамки на переходе).
+        for b in 1 2 3 4 5 6 7 8; do
+          "$ADB" exec-out screencap -p > "$OUTD/$n-cut_$b.png" 2>/dev/null
+        done
+        sleep 1
         "$ADB" exec-out screencap -p > "$OUTD/$n-skip_0.png" 2>/dev/null
         tap "$START_X" "$START_Y"
         # 2nd cutscene (dialogue): let it play BENCH_CUTSCENE2_WAIT s (voice in the log), skip.
@@ -269,30 +343,124 @@ if [ "${BENCH:-0}" = "1" ]; then
           while [ -f "$OUTD/.inputs" ] && kill -0 "$BENCH_PID" 2>/dev/null; do
             if [ "$(stv scene)" != "0" ]; then sleep 2; continue; fi
             for k in 1 2 3; do tap "$X_X" "$X_Y"; sleep 0.3; done
+            # A: closes tutorial hints and jumps - keeps the run moving.
+            tap "$A_X" "$A_Y"; sleep 0.3
             "$ADB" shell input swipe "$LS_X" "$LS_Y" $((LS_X + LS_D)) "$LS_Y" 1200
             for k in 1 2 3; do tap "$X_X" "$X_Y"; sleep 0.3; done
+            tap "$A_X" "$A_Y"; sleep 0.3
             "$ADB" shell input swipe "$((LS_X + LS_D))" "$LS_Y" "$LS_X" "$LS_Y" 1200
           done
         ) &
       fi
       t=0
-      while [ "$t" -lt "${BENCH_GAME_WAIT:-45}" ]; do
+      while [ "$t" -lt "${BENCH_GAME_WAIT:-25}" ]; do
         sleep 5; t=$((t + 5))
         "$ADB" exec-out screencap -p > "$OUTD/$n-game_$(printf %03d $t)s.png" 2>/dev/null
       done
+      if [ "${BENCH_FLASH:-0}" = "1" ]; then
+        mkdir -p "$OUTD/$n-flash"
+        "$ADB" exec-out run-as $PKG sh -c "'cd files && ls flash_* 2>/dev/null | xargs tar -cf -'" \
+          | tar -xf - -C "$OUTD/$n-flash" 2>/dev/null
+        "$ADB" shell run-as $PKG ls -la files > "$OUTD/$n-files.txt" 2>/dev/null
+        "$ADB" logcat -d -s 4DevilTearsTouch:I > "$OUTD/$n-touch.log" 2>/dev/null
+        echo "  вспышки: $(ls "$OUTD/$n-flash" 2>/dev/null | grep -c png) кадров; $(head -c 300 "$OUTD/$n-flash/flash_log.txt" 2>/dev/null | head -3 | tr '\n' ';')"
+      fi
       if [ -n "$REC_PID" ]; then
         wait "$REC_PID" 2>/dev/null; sleep 1
         "$ADB" pull /sdcard/4dt_game.mp4 "$OUTD/$n-game.mp4" >/dev/null 2>&1
       fi
     fi
+    if [ -n "${BENCH_LIVE:-}" ] && [ "$n" = "1" ]; then
+      # Сравнение вариантов без перезапуска игры: флаги переключаются на ходу
+      # (files/flags_now.txt), варианты идут по кругу A B C A B C ... — нагрев и сцена
+      # влияют на все одинаково. Строки: work/bench/<BENCH_LIVE>.txt, "имя | --флаг=знач ...".
+      LSET="$WORK/bench/$BENCH_LIVE.txt"; LR="${BENCH_LIVE_ROUNDS:-3}"; LM="${BENCH_LIVE_MEASURE:-12}"
+      LOUT="$OUTD/live.txt"
+      printf "%-14s %5s %6s %7s %7s %8s %9s\n" "вариант" "круг" "FPS" "медиана" "p95,мс" "GPU,МГц" "Мцикл/кадр" | tee "$LOUT"
+      for r in $(seq 1 "$LR"); do
+        while IFS='|' read -r LN LF <&4; do
+          LN="$(echo "$LN" | xargs)"; case "$LN" in ''|'#'*) continue;; esac
+          echo "$LF" | tr ' ' '\n' | sed -n 's/^--//p' | "$ADB" exec-in run-as $PKG sh -c 'cat > files/flags_now.txt'
+          sleep 4
+          C0="$("$ADB" exec-out run-as $PKG cat files/perf.csv 2>/dev/null </dev/null | wc -l)"
+          LF0="$OUTD/live_${r}_$LN"
+          touch "$LF0.freqon"
+          ( while [ -f "$LF0.freqon" ]; do "$ADB" shell cat /sys/class/misc/mali0/device/cur_freq 2>/dev/null | tr -d '\r'; sleep 1; done > "$LF0.freq" ) &
+          if [ "${BENCH_COUNTERS:-0}" = "1" ] && [ -x "$ROOT/tools/malic/malicounters" ]; then
+            "$ADB" push "$ROOT/tools/malic/malicounters" /data/local/tmp/malicounters >/dev/null 2>&1
+            "$ADB" shell /data/local/tmp/malicounters "$LM" > "$LF0.counters" 2>&1 || sleep "$LM"
+          else
+            sleep "$LM"
+          fi
+          rm -f "$LF0.freqon"
+          "$ADB" exec-out screencap -p > "$LF0.png" 2>/dev/null </dev/null
+          "$ADB" exec-out run-as $PKG cat files/perf.csv 2>/dev/null | tail -n +$((C0 + 1)) \
+            | awk -F, '$1 ~ /^[0-9]+$/ && $1 > 0 { print $1 / 1000 }' | sort -n > "$LF0.ms"
+          FQ="$(awk '$1 > 0 { s += $1; n++ } END { if (n) printf "%d", s / n / 1000 }' "$LF0.freq" 2>/dev/null)"
+          CY="$(awk '/^GPU active cycles/ { print $(NF - 1) }' "$LF0.counters" 2>/dev/null)"
+          awk -v name="$LN" -v r="$r" -v fq="${FQ:--}" -v cy="${CY:-0}" '
+            { a[++n] = $1; t += $1 }
+            END {
+              if (!n) { printf "%-14s %5d нет данных\n", name, r; exit }
+              fps = n * 1000 / t; med = a[int((n + 1) / 2)]; i95 = int(n * 0.95); if (i95 < 1) i95 = 1
+              printf "%-14s %5d %6.1f %7.1f %7.1f %8s %9.1f\n", name, r, fps, med, a[i95], fq, (cy > 0 ? cy / fps / 1e6 : 0)
+            }' "$LF0.ms" | tee -a "$LOUT"
+        done 4< "$LSET"
+      done
+      # Итог по вариантам (среднее по кругам).
+      echo "--- среднее по кругам" | tee -a "$LOUT"
+      awk 'NR > 1 && $2 ~ /^[0-9]+$/ { f[$1] += $3; m[$1] += $7; q[$1] += $6; c[$1]++; if (!($1 in o)) { o[$1] = ++k; nm[k] = $1 } }
+        END { for (i = 1; i <= k; i++) { v = nm[i]; printf "%-14s FPS %5.1f  GPU %4.0f МГц  %6.1f Мцикл/кадр\n", v, f[v] / c[v], q[v] / c[v], m[v] / c[v] } }' "$LOUT" | tee -a "$LOUT"
+      cat "$LOUT" >> "$OUTD/summary.txt"
+    fi
     "$ADB" exec-out run-as $PKG cat files/perf.csv > "$OUTD/$n-$NAME.before.csv" 2>/dev/null
     T0="$(skin_temp)"
-    sleep "$MEASURE"
+    # Частота видеочипа раз в секунду за время замера (Pixel: /sys/class/misc/mali0/device/cur_freq).
+    touch "$OUTD/.freq"
+    ( while [ -f "$OUTD/.freq" ]; do
+        "$ADB" shell cat /sys/class/misc/mali0/device/cur_freq 2>/dev/null | tr -d '\r'; sleep 1
+      done > "$OUTD/$n-$NAME.gpufreq.txt" ) &
+    if [ "${BENCH_SHOTS:-0}" -gt 0 ]; then
+      # Несколько снимков за время замера (поиск мигающих артефактов).
+      step=$(( MEASURE / BENCH_SHOTS )); [ "$step" -ge 1 ] || step=1
+      for k in $(seq 1 "$BENCH_SHOTS"); do
+        sleep "$step"
+        "$ADB" exec-out screencap -p > "$OUTD/$n-shot_$k.png" 2>/dev/null
+      done
+    elif [ "${BENCH_CPUPROF:-0}" = "1" ]; then
+      # Профиль CPU за время замера: какие потоки заняты, где ждут.
+      "$ADB" shell setprop security.perf_harden 0
+      "$ADB" shell "simpleperf record --app $PKG -e cpu-clock -g -f 500 --duration $MEASURE -o /data/local/tmp/perf.data" >/dev/null 2>&1
+      {
+        echo "===== threads"
+        "$ADB" shell "simpleperf report -i /data/local/tmp/perf.data --sort tid,comm -n --percent-limit 0.5" 2>&1
+        echo "===== symbols"
+        "$ADB" shell "simpleperf report -i /data/local/tmp/perf.data --sort comm,dso,symbol -n --percent-limit 0.3" 2>&1
+      } > "$OUTD/$n-$NAME.cpu.txt"
+      "$ADB" shell "simpleperf record --app $PKG --trace-offcpu -e cpu-clock -g -f 500 --duration 6 -o /data/local/tmp/perf_off.data" >/dev/null 2>&1
+      {
+        echo "===== offcpu threads"
+        "$ADB" shell "simpleperf report -i /data/local/tmp/perf_off.data --sort tid,comm -n --percent-limit 1" 2>&1
+        echo "===== offcpu symbols"
+        "$ADB" shell "simpleperf report -i /data/local/tmp/perf_off.data --sort comm,symbol -n --percent-limit 0.5" 2>&1
+      } >> "$OUTD/$n-$NAME.cpu.txt"
+    elif [ "${BENCH_COUNTERS:-0}" = "1" ] && [ -x "$ROOT/tools/malic/malicounters" ]; then
+      # Счётчики видеочипа Mali за время замера (что ограничивает: фрагменты, вершины, память).
+      "$ADB" push "$ROOT/tools/malic/malicounters" /data/local/tmp/malicounters >/dev/null 2>&1
+      "$ADB" shell chmod 755 /data/local/tmp/malicounters
+      "$ADB" shell /data/local/tmp/malicounters "$MEASURE" > "$OUTD/$n-$NAME.counters.txt" 2>&1 \
+        || sleep "$MEASURE"
+    else
+      sleep "$MEASURE"
+    fi
     T1="$(skin_temp)"
+    rm -f "$OUTD/.freq"
+    awk '$1 > 0 { s += $1; n++ } END { if (n) printf "  частота GPU: средняя %d МГц (%d замеров)\n", s / n / 1000, n }' \
+      "$OUTD/$n-$NAME.gpufreq.txt" 2>/dev/null | tee -a "$OUTD/freq_summary.txt"
     rm -f "$OUTD/.inputs"
     "$ADB" exec-out run-as $PKG cat files/perf.csv > "$OUTD/$n-$NAME.csv" 2>/dev/null
     "$ADB" exec-out screencap -p > "$OUTD/$n-$NAME.png" 2>/dev/null
-    if [ "${BENCH_TRACE:-1}" = "1" ] && [ "$n" = "1" ]; then
+    if [ "${BENCH_TRACE:-0}" = "1" ] && [ "$n" = "1" ]; then
       # Подробный снимок одного кадра титульного экрана: команды GPU + текстуры из памяти.
       "$ADB" shell run-as $PKG rm -rf files/frame_trace.txt files/tex
       "$ADB" shell run-as $PKG touch files/trace_now
@@ -301,10 +469,10 @@ if [ "${BENCH:-0}" = "1" ]; then
         "$ADB" shell run-as $PKG sh -c "'grep -q ^SWAP files/frame_trace.txt 2>/dev/null'" && break
       done
       "$ADB" exec-out run-as $PKG cat files/frame_trace.txt > "$OUTD/frame_trace.txt" 2>/dev/null
-      "$ADB" exec-out run-as $PKG tar -cf - files/tex > "$OUTD/textures.tar" 2>/dev/null
+      [ "${BENCH_TRACE_TEX:-1}" = "1" ] && "$ADB" exec-out run-as $PKG tar -cf - files/tex > "$OUTD/textures.tar" 2>/dev/null
       "$ADB" exec-out screencap -p > "$OUTD/frame_trace_screen.png" 2>/dev/null
       echo "  снимок кадра: $(grep -c '^D ' "$OUTD/frame_trace.txt" 2>/dev/null) draw, текстур $(tar -tf "$OUTD/textures.tar" 2>/dev/null | grep -c bin)"
-      "$ADB" exec-out run-as $PKG tar -cf - files/shaders > "$OUTD/shaders.tar" 2>/dev/null
+      [ "${BENCH_TRACE_TEX:-1}" = "1" ] && "$ADB" exec-out run-as $PKG tar -cf - files/shaders > "$OUTD/shaders.tar" 2>/dev/null
       [ -s "$OUTD/shaders.tar" ] || rm -f "$OUTD/shaders.tar"
     fi
     ALIVE="$("$ADB" shell pidof $PKG | tr -d '\r')"
@@ -345,6 +513,13 @@ if [ "${BENCH:-0}" = "1" ]; then
   cat "$OUTD/compile.txt" >> "$OUTD/summary.txt" 2>/dev/null
   "$ADB" shell run-as $PKG rm -f files/args.txt
   "$ADB" shell am force-stop $PKG
+  # Место на диске: снимки экрана -> JPEG 1200 px (вспышки flash_* остаются PNG).
+  if command -v sips >/dev/null 2>&1; then
+    for f in "$OUTD"/*.png; do
+      [ -f "$f" ] || continue
+      sips -s format jpeg -s formatOptions 75 -Z 1200 "$f" --out "${f%.png}.jpg" >/dev/null 2>&1 && rm -f "$f"
+    done
+  fi
   echo "результаты: $OUTD/summary.txt"; echo "BENCH_DONE"; exit 0
 fi
 
@@ -359,7 +534,7 @@ if [ "${TRACE:-0}" = "1" ]; then
   # Каждый снимок - в свою папку logs/trace_<время>[_<TRACE_NAME>]: ничего не перезаписывается.
   # TRACE_NAME=menu_pause - подпись (что на экране); TRACE_TEX=0 - без текстур (~200 МБ).
   "$ADB" shell pidof $PKG >/dev/null 2>&1 || { echo "Игра не запущена"; exit 1; }
-  TD="$WORK/logs/trace_$(date +%m%d_%H%M%S)${TRACE_NAME:+_$TRACE_NAME}"; mkdir -p "$TD"
+  TD="$WORK/logs/trace_$(date +%m%d_%H%M%S)${LOGTAG}${TRACE_NAME:+_$TRACE_NAME}"; mkdir -p "$TD"
   "$ADB" exec-out screencap -p > "$TD/screen_before.png" 2>/dev/null
   "$ADB" shell run-as $PKG rm -rf files/frame_trace.txt files/tex
   "$ADB" shell run-as $PKG touch files/trace_now
@@ -438,6 +613,59 @@ if [ "${SKIP_DATA:-0}" != "1" ]; then
   fi
 fi
 "$ADB" logcat -c
+if [ "${UI_CAPTURE:-0}" = "1" ]; then
+  # Запись раскладки меню: игра пишет спрайты каждого экрана меню (UISPR в dmc4.log), приложение
+  # сохраняет снимок каждого экрана / положения курсора (files/ui_*.png). Пройдите по всем меню,
+  # затем закройте игру (смахнуть из списка приложений) - файлы скачаются сами.
+  "$ADB" shell run-as $PKG sh -c "'rm -f files/ui_*.png'"
+  "$ADB" shell run-as $PKG touch files/ui_capture
+  "$ADB" shell run-as $PKG rm -f files/ui_draws.txt
+  printf '%s\n' --dmc4_ui_capture=true --ui_capture_draws=true --ui_capture_file=/data/user/0/$PKG/files/ui_draws.txt | "$ADB" exec-in run-as $PKG sh -c 'cat > files/args.txt'
+  LOG0="$("$ADB" shell run-as $PKG sh -c "'cat files/dmc4.log 2>/dev/null | wc -l'" | tr -d '\r ')"; LOG0="${LOG0:-0}"
+  echo "== запуск с записью меню: пройдите по всем меню, потом закройте игру"
+  "$ADB" shell am start -n "$ACT" >/dev/null
+  OUTD="$WORK/logs/ui_$(date +%m%d_%H%M)${LOGTAG}"; mkdir -p "$OUTD"
+  # Видео экрана частями по 170 с (запасной источник кадров; время начала каждой части - по часам
+  # телефона, чтобы сопоставить с dmc4.log).
+  if [ -n "${UI_QUICK:-}" ]; then
+    # Быстрая проверка записи: без видео, приложение закрывается само через UI_QUICK секунд.
+    sleep "$UI_QUICK"
+    "$ADB" shell am force-stop $PKG
+    "$ADB" exec-out run-as $PKG cat files/ui_draws.txt > "$OUTD/ui_draws.txt" 2>/dev/null
+    "$ADB" exec-out run-as $PKG cat files/dmc4.log > "$OUTD/dmc4.log" 2>/dev/null
+    "$ADB" shell run-as $PKG rm -f files/ui_capture files/args.txt
+    echo "== ui_draws.txt: $(wc -l < "$OUTD/ui_draws.txt") строк, кадров: $(grep -c 'UIDRAW frame' "$OUTD/ui_draws.txt")"
+    echo "UI_CAPTURE_DONE $OUTD"; exit 0
+  fi
+  "$ADB" shell "rm -f /sdcard/ui_rec_*.mp4"
+  (
+    k=0
+    while [ -n "$("$ADB" shell pidof $PKG | tr -d '\r')" ] && [ $k -lt 40 ]; do
+      echo "$k $("$ADB" shell date +%H:%M:%S | tr -d '\r')" >> "$OUTD/rec_times.txt"
+      "$ADB" shell screenrecord --time-limit 170 --bit-rate 4000000 --size 1200x540 /sdcard/ui_rec_$k.mp4
+      k=$((k + 1))
+    done
+  ) &
+  REC_LOOP=$!
+  sleep 15
+  for i in $(seq 1 1200); do
+    [ -z "$("$ADB" shell pidof $PKG | tr -d '\r')" ] && break
+    sleep 3
+  done
+  "$ADB" shell pkill -INT screenrecord 2>/dev/null; sleep 2; kill $REC_LOOP 2>/dev/null
+  for f in $("$ADB" shell "ls /sdcard/ui_rec_*.mp4 2>/dev/null" | tr -d '\r'); do
+    "$ADB" pull "$f" "$OUTD/" >/dev/null 2>&1
+  done
+  "$ADB" shell "rm -f /sdcard/ui_rec_*.mp4"
+  "$ADB" exec-out run-as $PKG sh -c "'cd files && ls ui_*.png 2>/dev/null | xargs tar -cf -'" | tar -xf - -C "$OUTD" 2>/dev/null
+  "$ADB" exec-out run-as $PKG cat files/dmc4.1.log > "$OUTD/dmc4.1.log" 2>/dev/null
+  "$ADB" exec-out run-as $PKG cat files/dmc4.log > "$OUTD/dmc4.log" 2>/dev/null
+  "$ADB" exec-out run-as $PKG cat files/ui_draws.txt > "$OUTD/ui_draws.txt" 2>/dev/null
+  echo "== ui_draws.txt: $(wc -l < "$OUTD/ui_draws.txt") строк, кадров: $(grep -c 'UIDRAW frame' "$OUTD/ui_draws.txt")"
+  "$ADB" shell run-as $PKG rm -f files/ui_capture files/args.txt
+  echo "== снимков меню: $(ls "$OUTD" | grep -c png), экранов в логе: $(grep -c UISCREEN "$OUTD/dmc4.log")"
+  echo "UI_CAPTURE_DONE $OUTD"; exit 0
+fi
 echo "== запуск"
 "$ADB" shell am start -n "$ACT"
 echo "INSTALL_DONE  (через 1–2 минуты:  LOGS=1 bash \"$0\")"

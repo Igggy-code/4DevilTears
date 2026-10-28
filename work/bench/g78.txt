@@ -1,0 +1,7 @@
+# Pixel 6 (Mali-G78): полоса сверху / мигание. Какой из мобильных режимов виноват.
+# Снимки экрана каждые 3 с -> logs/bench_*/<N>-<имя>_*.png
+base        | --anisotropic_override=-1
+tight_off   | --vulkan_tight_render_area=false --vulkan_tight_transfer_area=false
+cpu_vs_off  | --execute_unclipped_draw_vs_on_cpu=false
+robust_on   | --vulkan_robust_buffer_access=true
+all_off     | --vulkan_tight_render_area=false --vulkan_tight_transfer_area=false --execute_unclipped_draw_vs_on_cpu=false --vulkan_robust_buffer_access=true

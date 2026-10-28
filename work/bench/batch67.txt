@@ -1,0 +1,4 @@
+# Пачка v66+v67: всё включено / без «не загружать при очистке» / без обоих (как до v66).
+gp_new     | @gameplay
+gp_noload  | @gameplay --vulkan_dont_load_overwritten=false
+gp_base    | @gameplay --vulkan_dont_load_overwritten=false --rt_skip_transfers_before_overwrite=false

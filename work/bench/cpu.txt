@@ -1,0 +1,2 @@
+# Профиль CPU в геймплее (simpleperf): какой поток ограничивает FPS. ~3 мин.
+gp_cpu     | @gameplay

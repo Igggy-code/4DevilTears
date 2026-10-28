@@ -1,0 +1,4 @@
+# v75 (загрузки не ждут пиксельную стадию) вкл/выкл; noboth — без v74 и v75.
+all      | --vulkan_upload_barrier_no_fragment=true --vulkan_texture_fragment_only_barrier=true
+noupload | --vulkan_upload_barrier_no_fragment=false --vulkan_texture_fragment_only_barrier=true
+noboth   | --vulkan_upload_barrier_no_fragment=false --vulkan_texture_fragment_only_barrier=false

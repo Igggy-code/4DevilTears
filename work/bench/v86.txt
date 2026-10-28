@@ -1,0 +1,5 @@
+# v87: 1) по умолчанию (замена переносов очисткой вкл; общая прямая запись и запас 8 пикселей выкл) 2) без замены 3) общая прямая запись вкл 4) запас 8 пикселей вкл
+gp_fill    | @gameplay
+gp_nofill  | @gameplay --rt_uniform_clear_fill=false
+gp_share   | @gameplay --fast_resolve_zero_copy_share=true
+gp_slack   | @gameplay --fast_resolve_zero_copy_slack=true

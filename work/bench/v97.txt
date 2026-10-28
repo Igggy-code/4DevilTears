@@ -1,0 +1,4 @@
+# v97: 1) сцена за один проход (исправлен расчёт высоты) 2) по умолчанию, полосами 3) по умолчанию + профиль GPU по проходам
+gp_onepass  | @gameplay --collapse_predicated_tiling=true
+gp_v97      | @gameplay
+gp_prof     | @gameplay --gpu_profile=true

@@ -1,0 +1,3 @@
+# Геймплей + профайлер проходов видеочипа (куда уходит время кадра), ~6 мин.
+gp_new     | @gameplay
+gp_profile | @gameplay --gpu_profile=true

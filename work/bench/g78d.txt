@@ -1,0 +1,7 @@
+# Pixel 6 (Mali-G78), шаг 4: валидатор чист, а полоса есть. Делим наши изменения рендера
+# на группы и возвращаем каждую к исходному поведению ReXGlue/Xenia. Запуск с BENCH_SHOTS=8.
+base        | --anisotropic_override=-1
+upstream    | --vulkan_tight_render_area=false --vulkan_tight_transfer_area=false --rt_mobile_transfers=false --fast_resolve=0 --force_msaa_1x=false --execute_unclipped_draw_vs_on_cpu=false --shared_memory_hoist_uploads=false --texture_reupload_on_load=false --texture_verify_contents=0 --physical_force_invalidation=false --shader_mul_zero_dx9=true --shader_ps_allow_contraction=false --shader_tfetch_implicit_lod=false --alpha_to_coverage_1x_dither=true --texture_own_bc_decoders=false
+shaders     | --shader_mul_zero_dx9=true --shader_ps_allow_contraction=false --shader_tfetch_implicit_lod=false --alpha_to_coverage_1x_dither=true --texture_own_bc_decoders=false
+memory      | --shared_memory_hoist_uploads=false --texture_reupload_on_load=false --texture_verify_contents=0 --physical_force_invalidation=false
+targets     | --vulkan_tight_render_area=false --vulkan_tight_transfer_area=false --rt_mobile_transfers=false --fast_resolve=0 --force_msaa_1x=false

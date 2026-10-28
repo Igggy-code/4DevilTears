@@ -1,0 +1,8 @@
+# Pixel 6 (Mali-G78), шаг 3: части кадра со старым/недорисованным содержимым — у всех вариантов
+# шагов 1-2. Проверяем то, что зависит от драйвера: dynamic rendering, асинхронные конвейеры,
+# пропуск неполных кадров, отправку буферов. Запуск с BENCH_SHOTS=8 (8 снимков за замер).
+base           | --anisotropic_override=-1
+dynrender_off  | --vulkan_dynamic_rendering=false
+async_off      | --async_shader_compilation=false
+skipframes_off | --vulkan_async_skip_incomplete_frames=false
+submit_off     | --vulkan_submit_on_primary_buffer_end=false

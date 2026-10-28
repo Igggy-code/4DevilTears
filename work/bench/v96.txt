@@ -1,0 +1,4 @@
+# v96: 1) по умолчанию (очистки слиты с проходом сцены) 2) без слияния 3) сцена за один проход (испытание)
+gp_v96      | @gameplay
+gp_nomerge  | @gameplay --vulkan_merge_clear_passes=false
+gp_onepass  | @gameplay --collapse_predicated_tiling=true

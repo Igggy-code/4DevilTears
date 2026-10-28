@@ -1,0 +1,4 @@
+# v92: 1) по умолчанию (сцена за один проход + проходы-очистки без загрузки + исправление вспышки) 2) сцена полосами 3) очистки с загрузкой, как раньше
+gp_v92      | @gameplay
+gp_bands    | @gameplay --collapse_predicated_tiling=false
+gp_load     | @gameplay --vulkan_clear_pass_no_load=false

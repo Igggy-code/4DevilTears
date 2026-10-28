@@ -1,0 +1,4 @@
+# Барьеры текстур только для пиксельного этапа (v74): вкл / выкл; base — всё как до v66.
+all      | --rt_skip_transfers_before_overwrite=true --vulkan_dont_load_overwritten=true --fast_resolve_overlap_on_memory_reads_only=true --vulkan_pass_area_viewport=true --vulkan_texture_fragment_only_barrier=true
+nofrag   | --rt_skip_transfers_before_overwrite=true --vulkan_dont_load_overwritten=true --fast_resolve_overlap_on_memory_reads_only=true --vulkan_pass_area_viewport=true --vulkan_texture_fragment_only_barrier=false
+base     | --rt_skip_transfers_before_overwrite=false --vulkan_dont_load_overwritten=false --fast_resolve_overlap_on_memory_reads_only=false --vulkan_pass_area_viewport=false --vulkan_texture_fragment_only_barrier=false

@@ -1,0 +1,3 @@
+# Прямая запись копий кадра в текстуры (zero-copy, v77) вкл / выкл. Очистки HLE включены в обоих.
+gp_zc      | @gameplay
+gp_nozc    | @gameplay --fast_resolve_zero_copy=false
