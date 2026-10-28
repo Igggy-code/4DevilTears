@@ -63,6 +63,54 @@ index 41e6dce..a7e4a32 100644
              target_compile_options(${target_name} PRIVATE -march=armv8-a)
          endif()
      endif()
+diff --git a/include/rex/audio/dmc4_recorder.h b/include/rex/audio/dmc4_recorder.h
+new file mode 100644
+index 0000000..219553b
+--- /dev/null
++++ b/include/rex/audio/dmc4_recorder.h
+@@ -0,0 +1,42 @@
++// [4DevilTears] Debug recorder: switched on by hand (a button / gesture in the app, or a
++// runner job) right before a known problem spot. While on, subsystems write compact state
++// lines into a separate file: audio (XMA contexts, audio clients), kernel waits that last,
++// file reads, frames. A watchdog dumps every guest thread blocked for a while.
++#pragma once
++
++#include <cstdint>
++#include <string>
++
++#include <fmt/format.h>
++
++#define DMC4REC_API __attribute__((visibility("default")))
++
++namespace rex::dmc4rec {
++
++DMC4REC_API bool On();
++DMC4REC_API void Line(const std::string& text);
++template <typename... Args>
++inline void Log(fmt::format_string<Args...> f, Args&&... args) {
++  if (On()) Line(fmt::format(f, std::forward<Args>(args)...));
++}
++
++// Something called every ~500 ms by the watchdog while recording (state summaries).
++using TickFn = void (*)(void* user);
++DMC4REC_API void AddTick(TickFn fn, void* user);
++
++// A guest wait in progress (the watchdog reports the ones that take long).
++class DMC4REC_API WaitScope {
++ public:
++  WaitScope(const char* kind, uint32_t object, uint32_t type, uint32_t count, bool infinite);
++  ~WaitScope();
++
++ private:
++  bool active_ = false;
++  uint64_t slot_ = 0;
++};
++
++}  // namespace rex::dmc4rec
++
++extern "C" DMC4REC_API void Rex4dtRecStart(const char* path);
++extern "C" DMC4REC_API void Rex4dtRecStop();
++extern "C" DMC4REC_API void Rex4dtRecNote(const char* text);
 diff --git a/include/rex/audio/xma/context.h b/include/rex/audio/xma/context.h
 index 8426798..7e19149 100644
 --- a/include/rex/audio/xma/context.h
@@ -77,6 +125,26 @@ index 8426798..7e19149 100644
    uint8_t pending_output_limit_ = 0;
    uint8_t pending_start_skip_ = 0;
  };
+diff --git a/include/rex/audio/xma/decoder.h b/include/rex/audio/xma/decoder.h
+index df00f06..00215f2 100644
+--- a/include/rex/audio/xma/decoder.h
++++ b/include/rex/audio/xma/decoder.h
+@@ -58,6 +58,7 @@ class XmaDecoder {
+ 
+  private:
+   void WorkerThreadMain();
++  void RecTick();  // [4DevilTears] debug recorder summary
+ 
+   static uint32_t MMIOReadRegisterThunk(void* ppc_context, XmaDecoder* as, uint32_t addr) {
+     return as->ReadRegister(addr);
+@@ -87,6 +88,7 @@ class XmaDecoder {
+ 
+   uint32_t context_data_first_ptr_ = 0;
+   uint32_t context_data_last_ptr_ = 0;
++  uint32_t rec_work_[kContextCount] = {};
+ };
+ 
+ }  // namespace rex::audio
 diff --git a/include/rex/chrono/chrono.h b/include/rex/chrono/chrono.h
 index d876846..6f4b3f0 100644
 --- a/include/rex/chrono/chrono.h
@@ -1185,6 +1253,270 @@ index 50638d6..78d704d 100644
  
  namespace rex {
  namespace ui {
+diff --git a/src/audio/CMakeLists.txt b/src/audio/CMakeLists.txt
+index d55f16a..c28bd11 100644
+--- a/src/audio/CMakeLists.txt
++++ b/src/audio/CMakeLists.txt
+@@ -9,6 +9,7 @@ add_library(rexaudio OBJECT
+     xma_context.cpp
+     xma_decoder.cpp
+     xma_register_file.cpp
++    dmc4_recorder.cpp
+     # NOP backend (always available)
+     nop/nop_audio_system.cpp
+     # SDL backend
+diff --git a/src/audio/audio_system.cpp b/src/audio/audio_system.cpp
+index 7a711a8..d2eec33 100644
+--- a/src/audio/audio_system.cpp
++++ b/src/audio/audio_system.cpp
+@@ -9,6 +9,7 @@
+  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
+  */
+ 
++#include <rex/audio/dmc4_recorder.h>
+ #include <rex/assert.h>
+ #include <rex/audio/audio_driver.h>
+ #include <rex/audio/audio_system.h>
+@@ -77,7 +78,23 @@ AudioSystem::~AudioSystem() {
+   }
+ }
+ 
++// [4DevilTears] Debug recorder: audio client callbacks / submitted frames per half second.
++namespace {
++std::atomic<uint32_t> g_rec_callbacks[8];
++std::atomic<uint32_t> g_rec_submits[8];
++std::atomic<uint32_t> g_rec_timeouts{0};
++void RecAudioTick(void*) {
++  std::string line = "AUDIO timeouts " + std::to_string(g_rec_timeouts.exchange(0));
++  for (int i = 0; i < 8; ++i) {
++    uint32_t cb = g_rec_callbacks[i].exchange(0), sb = g_rec_submits[i].exchange(0);
++    if (cb || sb) line += fmt::format(" | client{} callbacks {} frames {}", i, cb, sb);
++  }
++  rex::dmc4rec::Line(line);
++}
++}  // namespace
++
+ X_STATUS AudioSystem::Setup(system::KernelState* kernel_state) {
++  rex::dmc4rec::AddTick(RecAudioTick, nullptr);
+   X_STATUS result = xma_decoder_->Setup(kernel_state);
+   if (result) {
+     return result;
+@@ -114,6 +131,7 @@ void AudioSystem::WorkerThreadMain() {
+     }
+ 
+     if (result.first == rex::thread::WaitResult::kTimeout) {
++      g_rec_timeouts++;
+       if (diag_pump_count < 5) {
+         REXAPU_NOISY_DEBUG("AudioWorker: WaitAny timed out (no semaphore signals)");
+       }
+@@ -140,6 +158,7 @@ void AudioSystem::WorkerThreadMain() {
+       global_lock.unlock();
+ 
+       if (client_callback) {
++        if (index < 8) g_rec_callbacks[index]++;
+         if (diag_pump_count < 10) {
+           REXAPU_DEBUG("AudioWorker: dispatching callback {:08X} with arg {:08X} for client {}",
+                        client_callback, client_callback_arg, index);
+@@ -270,6 +289,7 @@ void AudioSystem::SubmitFrame(size_t index, uint32_t samples_ptr) {
+     submit_count++;
+   }
+ 
++  if (index < 8) g_rec_submits[index]++;
+   auto global_lock = global_critical_region_.Acquire();
+   assert_true(index < kMaximumClientCount);
+   assert_true(clients_[index].driver != NULL);
+diff --git a/src/audio/dmc4_recorder.cpp b/src/audio/dmc4_recorder.cpp
+new file mode 100644
+index 0000000..03d1a1c
+--- /dev/null
++++ b/src/audio/dmc4_recorder.cpp
+@@ -0,0 +1,186 @@
++// [4DevilTears] Debug recorder - see rex/audio/dmc4_recorder.h.
++#include <rex/audio/dmc4_recorder.h>
++
++#include <atomic>
++#include <chrono>
++#include <condition_variable>
++#include <cstdio>
++#include <mutex>
++#include <thread>
++#include <unordered_map>
++#include <vector>
++
++#include <rex/system/thread_state.h>
++#include <rex/system/xthread.h>
++
++namespace rex::dmc4rec {
++namespace {
++
++std::atomic<bool> g_on{false};
++std::mutex g_file_mutex;
++std::FILE* g_file = nullptr;
++std::chrono::steady_clock::time_point g_start;
++
++struct Wait {
++  const char* kind;
++  uint32_t object, type, count, thread_id, entry, lr;
++  bool infinite;
++  std::chrono::steady_clock::time_point since;
++  bool reported;
++};
++std::mutex g_wait_mutex;
++std::unordered_map<uint64_t, Wait> g_waits;
++std::atomic<uint64_t> g_wait_serial{1};
++
++std::mutex g_tick_mutex;
++std::vector<std::pair<TickFn, void*>> g_ticks;
++
++std::thread g_watchdog;
++std::mutex g_watch_mutex;
++std::condition_variable g_watch_cv;
++bool g_watch_stop = false;
++
++int64_t Ms() {
++  return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() -
++                                                               g_start)
++      .count();
++}
++
++void WatchdogMain() {
++  std::unique_lock<std::mutex> lock(g_watch_mutex);
++  while (!g_watch_stop) {
++    g_watch_cv.wait_for(lock, std::chrono::milliseconds(500));
++    if (g_watch_stop) break;
++    lock.unlock();
++    {
++      std::vector<std::pair<TickFn, void*>> ticks;
++      {
++        std::lock_guard<std::mutex> t(g_tick_mutex);
++        ticks = g_ticks;
++      }
++      for (auto& [fn, user] : ticks) fn(user);
++    }
++    // Guest threads blocked for more than 0.8 s.
++    std::vector<std::string> lines;
++    {
++      auto now = std::chrono::steady_clock::now();
++      std::lock_guard<std::mutex> w(g_wait_mutex);
++      for (auto& [slot, wt] : g_waits) {
++        auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(now - wt.since).count();
++        if (ms < 800) continue;
++        lines.push_back(fmt::format(
++            "WAIT{} t{:X} entry {:08X} lr {:08X} {} obj {:08X} type {} n{} {}ms{}",
++            wt.reported ? "" : "-NEW", wt.thread_id, wt.entry, wt.lr, wt.kind, wt.object,
++            wt.type, wt.count, ms, wt.infinite ? " infinite" : ""));
++        wt.reported = true;
++      }
++    }
++    for (auto& l : lines) Line(l);
++    {
++      std::lock_guard<std::mutex> f(g_file_mutex);
++      if (g_file) std::fflush(g_file);
++    }
++    lock.lock();
++  }
++}
++
++}  // namespace
++
++bool On() { return g_on.load(std::memory_order_relaxed); }
++
++void Line(const std::string& text) {
++  std::lock_guard<std::mutex> lock(g_file_mutex);
++  if (!g_file) return;
++  std::fprintf(g_file, "%8lld %s\n", (long long)Ms(), text.c_str());
++}
++
++void AddTick(TickFn fn, void* user) {
++  std::lock_guard<std::mutex> lock(g_tick_mutex);
++  g_ticks.emplace_back(fn, user);
++}
++
++WaitScope::WaitScope(const char* kind, uint32_t object, uint32_t type, uint32_t count,
++                     bool infinite) {
++  if (!On()) return;
++  Wait wt{};
++  wt.kind = kind;
++  wt.object = object;
++  wt.type = type;
++  wt.count = count;
++  wt.infinite = infinite;
++  wt.since = std::chrono::steady_clock::now();
++  if (auto* thread = rex::system::XThread::GetCurrentThread()) {
++    wt.thread_id = thread->thread_id();
++    wt.entry = thread->creation_params()->start_address;
++  }
++  if (auto* ts = rex::runtime::ThreadState::Get()) {
++    if (ts->context()) wt.lr = uint32_t(ts->context()->lr);
++  }
++  slot_ = g_wait_serial.fetch_add(1);
++  std::lock_guard<std::mutex> lock(g_wait_mutex);
++  g_waits.emplace(slot_, wt);
++  active_ = true;
++}
++
++WaitScope::~WaitScope() {
++  if (!active_) return;
++  Wait wt;
++  {
++    std::lock_guard<std::mutex> lock(g_wait_mutex);
++    auto it = g_waits.find(slot_);
++    if (it == g_waits.end()) return;
++    wt = it->second;
++    g_waits.erase(it);
++  }
++  if (wt.reported) {
++    auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
++                  std::chrono::steady_clock::now() - wt.since)
++                  .count();
++    Line(fmt::format("WAIT-END t{:X} {} obj {:08X} after {}ms", wt.thread_id, wt.kind, wt.object,
++                     ms));
++  }
++}
++
++}  // namespace rex::dmc4rec
++
++using namespace rex::dmc4rec;
++
++extern "C" void Rex4dtRecStart(const char* path) {
++  if (On()) return;
++  {
++    std::lock_guard<std::mutex> lock(g_file_mutex);
++    g_file = path && *path ? std::fopen(path, "w") : nullptr;
++    if (!g_file) return;
++    g_start = std::chrono::steady_clock::now();
++  }
++  g_on.store(true);
++  Line("REC start");
++  {
++    std::lock_guard<std::mutex> lock(g_watch_mutex);
++    g_watch_stop = false;
++  }
++  if (!g_watchdog.joinable()) g_watchdog = std::thread(WatchdogMain);
++}
++
++extern "C" void Rex4dtRecStop() {
++  if (!On()) return;
++  Line("REC stop");
++  g_on.store(false);
++  {
++    std::lock_guard<std::mutex> lock(g_watch_mutex);
++    g_watch_stop = true;
++  }
++  g_watch_cv.notify_all();
++  if (g_watchdog.joinable()) g_watchdog.join();
++  std::lock_guard<std::mutex> lock(g_file_mutex);
++  if (g_file) {
++    std::fclose(g_file);
++    g_file = nullptr;
++  }
++  std::lock_guard<std::mutex> w(g_wait_mutex);
++  g_waits.clear();
++}
++
++extern "C" void Rex4dtRecNote(const char* text) {
++  if (On() && text) Line(std::string("NOTE ") + text);
++}
 diff --git a/src/audio/sdl/sdl_audio_driver.cpp b/src/audio/sdl/sdl_audio_driver.cpp
 index 20a2cd8..a39db91 100644
 --- a/src/audio/sdl/sdl_audio_driver.cpp
@@ -1322,10 +1654,18 @@ index 11b83be..b8b4690 100644
      // Realign the decoder's output onto the bitstream's sample numbering: the
      // samples of the frame just decoded run from kDecoderStartPadding into this
 diff --git a/src/audio/xma_decoder.cpp b/src/audio/xma_decoder.cpp
-index a0a178d..2d09303 100644
+index a0a178d..cebc1c8 100644
 --- a/src/audio/xma_decoder.cpp
 +++ b/src/audio/xma_decoder.cpp
-@@ -52,6 +52,9 @@ REXCVAR_DEFINE_BOOL(ffmpeg_verbose, false, "Audio", "Verbose FFmpeg output (debu
+@@ -11,6 +11,7 @@
+ 
+ #include <rex/audio/xma/context.h>
+ #include <rex/audio/xma/decoder.h>
++#include <rex/audio/dmc4_recorder.h>
+ #include <rex/cvar.h>
+ #include <rex/dbg.h>
+ #include <rex/logging.h>
+@@ -52,6 +53,9 @@ REXCVAR_DEFINE_BOOL(ffmpeg_verbose, false, "Audio", "Verbose FFmpeg output (debu
  // do this, it's likely they are either passing the context to XAudio or
  // using the XMA* functions.
  
@@ -1335,7 +1675,7 @@ index a0a178d..2d09303 100644
  namespace rex::audio {
  
  XmaDecoder::XmaDecoder(runtime::FunctionDispatcher* function_dispatcher)
-@@ -64,6 +67,26 @@ void av_log_callback(void* avcl, int level, const char* fmt, va_list va) {
+@@ -64,6 +68,26 @@ void av_log_callback(void* avcl, int level, const char* fmt, va_list va) {
      return;
    }
  
@@ -1362,6 +1702,59 @@ index a0a178d..2d09303 100644
    string::StringBuffer buff;
    buff.AppendVarargs(fmt, va);
    auto msg = buff.to_string_view();
+@@ -111,6 +135,8 @@ X_STATUS XmaDecoder::Setup(system::KernelState* kernel_state) {
+   register_file_[XmaRegister::ContextArrayAddress] =
+       memory()->GetPhysicalAddress(context_data_first_ptr_);
+ 
++  rex::dmc4rec::AddTick([](void* user) { static_cast<XmaDecoder*>(user)->RecTick(); }, this);
++
+   // Setup XMA contexts.
+   for (size_t i = 0; i < kContextCount; ++i) {
+     uint32_t guest_ptr = context_data_first_ptr_ + i * sizeof(XMA_CONTEXT_DATA);
+@@ -145,6 +171,7 @@ void XmaDecoder::WorkerThreadMain() {
+       XmaContext& context = contexts_[n];
+       bool worked = context.Work();
+       if (worked) {
++        ++rec_work_[n];
+         context.SignalWorkDone();
+         PROFILE_XMA_FRAME_DECODED();
+       }
+@@ -164,6 +191,35 @@ void XmaDecoder::WorkerThreadMain() {
+   }
+ }
+ 
++// [4DevilTears] Debug recorder: every allocated XMA context, twice a second - enabled, how
++// many decode passes since the last line, input buffers (valid / packets / read offset),
++// output ring (valid / write / read offsets), loop and error state.
++void XmaDecoder::RecTick() {
++  std::string line = "XMA";
++  int shown = 0;
++  for (uint32_t n = 0; n < kContextCount; ++n) {
++    XmaContext& ctx = contexts_[n];
++    if (!ctx.is_allocated()) continue;
++    const uint32_t works = rec_work_[n];
++    rec_work_[n] = 0;
++    const void* ptr = memory()->TranslateVirtual(ctx.guest_ptr());
++    if (!ptr) continue;
++    XMA_CONTEXT_DATA d(ptr);
++    line += fmt::format(
++        " | c{} {}{} w{} in{}{} p{}/{} r{} cur{} out{} w{} r{} blk{} loop{} err{}{} stop{}", n,
++        ctx.is_enabled() ? "E" : "-", d.output_buffer_valid ? "" : "!", works,
++        int(d.input_buffer_0_valid), int(d.input_buffer_1_valid),
++        uint32_t(d.input_buffer_0_packet_count), uint32_t(d.input_buffer_1_packet_count),
++        uint32_t(d.input_buffer_read_offset), uint32_t(d.current_buffer),
++        int(d.output_buffer_valid), uint32_t(d.output_buffer_write_offset),
++        uint32_t(d.output_buffer_read_offset), uint32_t(d.output_buffer_block_count),
++        uint32_t(d.loop_count), uint32_t(d.error_status), d.error_set ? "!" : "",
++        int(d.stop_when_done));
++    if (++shown >= 24) break;
++  }
++  rex::dmc4rec::Line(line);
++}
++
+ void XmaDecoder::Shutdown() {
+   if (!worker_thread_) {
+     return;
 diff --git a/src/core/CMakeLists.txt b/src/core/CMakeLists.txt
 index 1ddafd0..633f919 100644
 --- a/src/core/CMakeLists.txt
@@ -8179,7 +8572,7 @@ index 0000000..4812f2a
 +
 +}  // namespace rex::graphics::vulkan::bc_decode
 diff --git a/src/graphics/vulkan/command_processor.cpp b/src/graphics/vulkan/command_processor.cpp
-index 001f36b..130dedc 100644
+index 001f36b..c0704e0 100644
 --- a/src/graphics/vulkan/command_processor.cpp
 +++ b/src/graphics/vulkan/command_processor.cpp
 @@ -9,7 +9,10 @@
@@ -8203,11 +8596,12 @@ index 001f36b..130dedc 100644
  #include <rex/assert.h>
  #include <rex/cvar.h>
  #include <rex/dbg.h>
-@@ -43,6 +49,11 @@
+@@ -43,6 +49,12 @@
  #include <rex/types.h>
  #include <rex/memory/utils.h>
  #include <rex/ui/flags.h>
 +#include <rex/graphics/frame_trace.h>
++#include <rex/audio/dmc4_recorder.h>
 +#include <cstdarg>
 +#include <cstdio>
 +#include <cmath>
@@ -8215,7 +8609,7 @@ index 001f36b..130dedc 100644
  #include <rex/ui/vulkan/presenter.h>
  #include <rex/ui/vulkan/util.h>
  
-@@ -55,6 +66,29 @@ REXCVAR_DEFINE_BOOL(vulkan_readback_memexport, false, "GPU/Vulkan",
+@@ -55,6 +67,29 @@ REXCVAR_DEFINE_BOOL(vulkan_readback_memexport, false, "GPU/Vulkan",
                      "Read data written by memory export in shaders on the CPU")
      .lifecycle(rex::cvar::Lifecycle::kHotReload);
  
@@ -8245,7 +8639,7 @@ index 001f36b..130dedc 100644
  REXCVAR_DEFINE_BOOL(vulkan_async_skip_incomplete_frames, true, "GPU/Vulkan",
                      "When async shader compilation is enabled, skip presenting frames that "
                      "used placeholder pipelines to avoid visible flashing")
-@@ -69,6 +103,623 @@ REXCVAR_DEFINE_BOOL(vulkan_dynamic_rendering, true, "GPU/Vulkan",
+@@ -69,6 +104,640 @@ REXCVAR_DEFINE_BOOL(vulkan_dynamic_rendering, true, "GPU/Vulkan",
                      "device (falls back to render passes otherwise)")
      .lifecycle(rex::cvar::Lifecycle::kHotReload);
  
@@ -8374,7 +8768,24 @@ index 001f36b..130dedc 100644
 +  return count;
 +}
 +
++// [4DevilTears] Debug recorder: frames presented per half second (a stall shows as 0).
++static std::atomic<uint32_t> g_4dt_rec_swaps{0};
++static std::atomic<uint32_t> g_4dt_rec_draws{0};
++static void Dmc4RecGpuTick(void*) {
++  rex::dmc4rec::Line(fmt::format("GPU swaps {} ui-draws {}", g_4dt_rec_swaps.exchange(0),
++                                 g_4dt_rec_draws.exchange(0)));
++}
++
 +static void Dmc4UiSpritesOnSwap() {
++  {
++    static bool registered = false;
++    if (!registered) {
++      registered = true;
++      rex::dmc4rec::AddTick(Dmc4RecGpuTick, nullptr);
++    }
++    ++g_4dt_rec_swaps;
++    g_4dt_rec_draws += g_ui_sprite_draw;
++  }
 +  if (!REXCVAR_GET(ui_touch_sprites)) return;
 +  {
 +    std::lock_guard<std::mutex> lock(g_ui_sprites_mutex);
@@ -8869,7 +9280,7 @@ index 001f36b..130dedc 100644
  namespace rex::graphics::vulkan {
  
  namespace {
-@@ -580,6 +1231,7 @@ VulkanCommandProcessor::VulkanCommandProcessor(VulkanGraphicsSystem* graphics_sy
+@@ -580,6 +1249,7 @@ VulkanCommandProcessor::VulkanCommandProcessor(VulkanGraphicsSystem* graphics_sy
                                                 system::KernelState* kernel_state)
      : CommandProcessor(graphics_system, kernel_state),
        deferred_command_buffer_(*this),
@@ -8877,7 +9288,7 @@ index 001f36b..130dedc 100644
        transient_descriptor_allocator_uniform_buffer_(
            static_cast<const ui::vulkan::VulkanProvider*>(graphics_system->provider())
                ->vulkan_device(),
-@@ -930,10 +1582,17 @@ bool VulkanCommandProcessor::SetupContext() {
+@@ -930,10 +1600,17 @@ bool VulkanCommandProcessor::SetupContext() {
      return false;
    }
    if (!device_properties.vertexPipelineStoresAndAtomics) {
@@ -8899,7 +9310,7 @@ index 001f36b..130dedc 100644
    }
    if (!device_properties.geometryShader) {
      if (REXCVAR_GET(vulkan_require_geometry_shader)) {
-@@ -2057,7 +2716,12 @@ void VulkanCommandProcessor::ShutdownContext() {
+@@ -2057,7 +2734,12 @@ void VulkanCommandProcessor::ShutdownContext() {
    sparse_buffer_binds_.clear();
    sparse_memory_binds_.clear();
  
@@ -8912,7 +9323,7 @@ index 001f36b..130dedc 100644
    for (const auto& command_buffer_pair : command_buffers_submitted_) {
      dfn.vkDestroyCommandPool(device, command_buffer_pair.second.pool, nullptr);
    }
-@@ -2269,8 +2933,327 @@ void VulkanCommandProcessor::OnGammaRampPWLValueWritten() {
+@@ -2269,8 +2951,327 @@ void VulkanCommandProcessor::OnGammaRampPWLValueWritten() {
    gamma_ramp_pwl_current_frame_ = UINT32_MAX;
  }
  
@@ -9240,7 +9651,7 @@ index 001f36b..130dedc 100644
    SCOPE_profile_cpu_f("gpu");
    vertex_buffers_in_sync_[0] = 0;
    vertex_buffers_in_sync_[1] = 0;
-@@ -2292,6 +3275,19 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
+@@ -2292,6 +3293,19 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
    bool skip_present_due_async_placeholder = REXCVAR_GET(async_shader_compilation) &&
                                              REXCVAR_GET(vulkan_async_skip_incomplete_frames) &&
                                              frame_used_async_placeholder_pipeline_;
@@ -9260,7 +9671,7 @@ index 001f36b..130dedc 100644
    if (skip_present_due_async_placeholder) {
      static bool skipped_incomplete_frame_logged = false;
      if (!skipped_incomplete_frame_logged) {
-@@ -2855,7 +3851,8 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
+@@ -2855,7 +3869,8 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
            render_pass_begin_info.renderArea.extent.height = guest_output_height;
            render_pass_begin_info.clearValueCount = 0;
            render_pass_begin_info.pClearValues = nullptr;
@@ -9270,7 +9681,7 @@ index 001f36b..130dedc 100644
                                                          VK_SUBPASS_CONTENTS_INLINE);
  
            VkViewport viewport;
-@@ -3091,13 +4088,22 @@ bool VulkanCommandProcessor::SubmitBarriers(bool force_end_render_pass) {
+@@ -3091,13 +4106,22 @@ bool VulkanCommandProcessor::SubmitBarriers(bool force_end_render_pass) {
  void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
      VkRenderPass render_pass, const VulkanRenderTargetCache::Framebuffer* framebuffer) {
    SubmitBarriers(false);
@@ -9294,7 +9705,7 @@ index 001f36b..130dedc 100644
        return;
      }
    } else {
-@@ -3107,16 +4113,23 @@ void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
+@@ -3107,16 +4131,23 @@ void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
    }
  
    if (in_render_pass_) {
@@ -9318,7 +9729,7 @@ index 001f36b..130dedc 100644
  
    if (use_dynamic_rendering) {
      VkRenderingAttachmentInfo color_attachments[xenos::kMaxColorRenderTargets];
-@@ -3141,7 +4154,11 @@ void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
+@@ -3141,7 +4172,11 @@ void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
      rendering_info.pColorAttachments = color_attachment_count ? color_attachments : nullptr;
      rendering_info.pDepthAttachment = has_depth ? &depth_attachment : nullptr;
      rendering_info.pStencilAttachment = has_stencil ? &stencil_attachment : nullptr;
@@ -9330,7 +9741,7 @@ index 001f36b..130dedc 100644
    } else {
      VkRenderPassBeginInfo render_pass_begin_info;
      render_pass_begin_info.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
-@@ -3155,10 +4172,14 @@ void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
+@@ -3155,10 +4190,14 @@ void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
      render_pass_begin_info.renderArea.extent = framebuffer->host_extent;
      render_pass_begin_info.clearValueCount = 0;
      render_pass_begin_info.pClearValues = nullptr;
@@ -9345,7 +9756,7 @@ index 001f36b..130dedc 100644
  }
  
  void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
-@@ -3171,7 +4192,8 @@ void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
+@@ -3171,7 +4210,8 @@ void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
  
    if (use_dynamic_rendering) {
      if (in_render_pass_ && current_framebuffer_ == framebuffer &&
@@ -9355,7 +9766,7 @@ index 001f36b..130dedc 100644
        return;
      }
    } else {
-@@ -3181,16 +4203,23 @@ void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
+@@ -3181,16 +4221,23 @@ void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
    }
  
    if (in_render_pass_) {
@@ -9379,7 +9790,7 @@ index 001f36b..130dedc 100644
  
    if (use_dynamic_rendering) {
      VkRenderingAttachmentInfo color_attachment = {};
-@@ -3235,6 +4264,9 @@ void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
+@@ -3235,6 +4282,9 @@ void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
      rendering_info.pColorAttachments = transfer_dest_is_depth ? nullptr : &color_attachment;
      rendering_info.pDepthAttachment = transfer_dest_is_depth ? &depth_attachment : nullptr;
      rendering_info.pStencilAttachment = transfer_dest_is_depth ? &stencil_attachment : nullptr;
@@ -9389,7 +9800,7 @@ index 001f36b..130dedc 100644
      deferred_command_buffer_.CmdVkBeginRendering(&rendering_info);
    } else {
      VkRenderPassBeginInfo render_pass_begin_info;
-@@ -3247,10 +4279,329 @@ void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
+@@ -3247,10 +4297,329 @@ void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
      render_pass_begin_info.renderArea.extent = framebuffer->host_extent;
      render_pass_begin_info.clearValueCount = 0;
      render_pass_begin_info.pClearValues = nullptr;
@@ -9719,7 +10130,7 @@ index 001f36b..130dedc 100644
  }
  
  void VulkanCommandProcessor::EndRenderPass() {
-@@ -3258,13 +4609,20 @@ void VulkanCommandProcessor::EndRenderPass() {
+@@ -3258,13 +4627,20 @@ void VulkanCommandProcessor::EndRenderPass() {
    if (!in_render_pass_) {
      return;
    }
@@ -9740,7 +10151,7 @@ index 001f36b..130dedc 100644
    in_render_pass_ = false;
  }
  
-@@ -3587,13 +4945,244 @@ Shader* VulkanCommandProcessor::LoadShader(xenos::ShaderType shader_type, uint32
+@@ -3587,13 +4963,244 @@ Shader* VulkanCommandProcessor::LoadShader(xenos::ShaderType shader_type, uint32
    return pipeline_cache_->LoadShader(shader_type, host_address, dword_count);
  }
  
@@ -9986,7 +10397,7 @@ index 001f36b..130dedc 100644
    const RegisterFile& regs = *register_file_;
    (void)index_buffer_info;
    auto draw_fail = [&](const char* stage) {
-@@ -3629,13 +5218,68 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
+@@ -3629,13 +5236,68 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
      return draw_fail("missing_vertex_shader");
    }
    pipeline_cache_->AnalyzeShaderUcode(*vertex_shader);
@@ -10059,7 +10470,7 @@ index 001f36b..130dedc 100644
      }
      draw_util::AddMemExportRanges(regs, *vertex_shader, memexport_ranges_);
    }
-@@ -3681,6 +5325,365 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
+@@ -3681,6 +5343,365 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
    }
    reg::RB_DEPTHCONTROL normalized_depth_control = draw_util::GetNormalizedDepthControl(regs);
  
@@ -10425,7 +10836,7 @@ index 001f36b..130dedc 100644
    uint32_t ps_param_gen_pos = UINT32_MAX;
    uint32_t interpolator_mask =
        pixel_shader ? (vertex_shader->writes_interpolators() &
-@@ -3835,6 +5838,7 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
+@@ -3835,6 +5856,7 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
    uint32_t used_texture_mask =
        vertex_shader->GetUsedTextureMaskAfterTranslation() |
        (pixel_shader != nullptr ? pixel_shader->GetUsedTextureMaskAfterTranslation() : 0);
@@ -10433,7 +10844,7 @@ index 001f36b..130dedc 100644
    texture_cache_->RequestTextures(used_texture_mask);
  
    const VulkanPipelineCache::PipelineLayoutProvider* pipeline_layout_provider;
-@@ -4111,14 +6115,22 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
+@@ -4111,14 +6133,22 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
    // After all commands that may dispatch, copy or insert barriers, submit
    // the barriers (may end the render pass), and (re)enter the render pass
    // before drawing.
@@ -10456,7 +10867,7 @@ index 001f36b..130dedc 100644
      deferred_command_buffer_.CmdVkDraw(primitive_processing_result.host_draw_vertex_count, 1, 0, 0);
    } else {
      std::pair<VkBuffer, VkDeviceSize> index_buffer;
-@@ -4150,10 +6162,33 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
+@@ -4150,10 +6180,33 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
          primitive_processing_result.host_index_format == xenos::IndexFormat::kInt16
              ? VK_INDEX_TYPE_UINT16
              : VK_INDEX_TYPE_UINT32);
@@ -10490,7 +10901,7 @@ index 001f36b..130dedc 100644
    // Invalidate textures in memexported memory and watch for changes.
    if (!memexport_ranges_.empty()) {
      for (const draw_util::MemExportRange& memexport_range : memexport_ranges_) {
-@@ -4382,6 +6417,63 @@ bool VulkanCommandProcessor::IssueDraw_MemexportReadbackFastPath(uint32_t total_
+@@ -4382,6 +6435,63 @@ bool VulkanCommandProcessor::IssueDraw_MemexportReadbackFastPath(uint32_t total_
  }
  
  bool VulkanCommandProcessor::IssueCopy() {
@@ -10554,7 +10965,7 @@ index 001f36b..130dedc 100644
  #if XE_GPU_FINE_GRAINED_DRAW_SCOPES
    SCOPE_profile_cpu_f("gpu");
  #endif  // XE_GPU_FINE_GRAINED_DRAW_SCOPES
-@@ -4393,8 +6485,22 @@ bool VulkanCommandProcessor::IssueCopy() {
+@@ -4393,8 +6503,22 @@ bool VulkanCommandProcessor::IssueCopy() {
    ReadbackResolveMode readback_mode = GetReadbackResolveMode(REXCVAR_GET(vulkan_readback_resolve));
    if (readback_mode == ReadbackResolveMode::kDisabled) {
      uint32_t written_address, written_length;
@@ -10579,7 +10990,7 @@ index 001f36b..130dedc 100644
    }
  
    return IssueCopy_ReadbackResolvePath();
-@@ -5016,6 +7122,77 @@ void VulkanCommandProcessor::CheckSubmissionFenceAndDeviceLoss(uint64_t await_su
+@@ -5016,6 +7140,77 @@ void VulkanCommandProcessor::CheckSubmissionFenceAndDeviceLoss(uint64_t await_su
                                        submissions_in_flight_fences_awaited_end);
    submission_completed_ += fences_awaited;
  
@@ -10657,7 +11068,7 @@ index 001f36b..130dedc 100644
    // Reclaim semaphores.
    while (!submissions_in_flight_semaphores_.empty()) {
      const auto& semaphore_submission = submissions_in_flight_semaphores_.front();
-@@ -5136,6 +7313,29 @@ bool VulkanCommandProcessor::BeginSubmission(bool is_guest_command) {
+@@ -5136,6 +7331,29 @@ bool VulkanCommandProcessor::BeginSubmission(bool is_guest_command) {
      // the end of the submission (when async pipeline object creation requests
      // are fulfilled).
      deferred_command_buffer_.Reset();
@@ -10687,7 +11098,7 @@ index 001f36b..130dedc 100644
  
      // Reset cached state of the command buffer.
      dynamic_viewport_update_needed_ = true;
-@@ -5150,6 +7350,7 @@ bool VulkanCommandProcessor::BeginSubmission(bool is_guest_command) {
+@@ -5150,6 +7368,7 @@ bool VulkanCommandProcessor::BeginSubmission(bool is_guest_command) {
      dynamic_stencil_reference_back_update_needed_ = true;
      current_render_pass_ = VK_NULL_HANDLE;
      current_framebuffer_ = nullptr;
@@ -10695,7 +11106,7 @@ index 001f36b..130dedc 100644
      in_render_pass_ = false;
      current_guest_graphics_pipeline_ = VK_NULL_HANDLE;
      current_external_graphics_pipeline_ = VK_NULL_HANDLE;
-@@ -5385,7 +7586,81 @@ bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
+@@ -5385,7 +7604,81 @@ bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
        REXGPU_ERROR("Failed to begin a Vulkan command buffer");
        return false;
      }
@@ -13921,11 +14332,14 @@ index 670c446..b9da6f2 100644
  
  // https://msdn.microsoft.com/en-us/library/xcb2z8hs.aspx
 diff --git a/src/kernel/xboxkrnl/xboxkrnl_io.cpp b/src/kernel/xboxkrnl/xboxkrnl_io.cpp
-index 3f1a852..1ed5123 100644
+index 3f1a852..2732cab 100644
 --- a/src/kernel/xboxkrnl/xboxkrnl_io.cpp
 +++ b/src/kernel/xboxkrnl/xboxkrnl_io.cpp
-@@ -14,7 +14,15 @@
+@@ -12,9 +12,18 @@
+ // Disable warnings about unused parameters for kernel functions
+ #pragma GCC diagnostic ignored "-Wunused-parameter"
  
++#include <rex/audio/dmc4_recorder.h>
  #include <rex/filesystem/device.h>
  #include <rex/kernel/xboxkrnl/private.h>
 +#include <rex/kernel/scene_state.h>
@@ -13940,7 +14354,7 @@ index 3f1a852..1ed5123 100644
  #include <rex/memory.h>
  #include <rex/hook.h>
  #include <rex/types.h>
-@@ -100,6 +108,79 @@ static bool IsValidPath(const std::string_view s, bool is_pattern) {
+@@ -100,6 +109,79 @@ static bool IsValidPath(const std::string_view s, bool is_pattern) {
    return true;
  }
  
@@ -14020,11 +14434,12 @@ index 3f1a852..1ed5123 100644
  u32 NtCreateFile_entry(mapped_u32 handle_out, u32 desired_access,
                         ppc_ptr_t<X_OBJECT_ATTRIBUTES> object_attrs,
                         ppc_ptr_t<X_IO_STATUS_BLOCK> io_status_block, mapped_u64 allocation_size_ptr,
-@@ -172,6 +253,11 @@ u32 NtCreateFile_entry(mapped_u32 handle_out, u32 desired_access,
+@@ -172,6 +254,12 @@ u32 NtCreateFile_entry(mapped_u32 handle_out, u32 desired_access,
      REXKRNL_IMPORT_FAIL("NtCreateFile", "path='{}' -> {:#x}", target_path, result);
    } else {
      REXKRNL_IMPORT_RESULT("NtCreateFile", "{:#x} handle={:#x}", result, handle);
 +    rex::kernel::scene::OnFileOpened(uint32_t(handle), target_path);
++    rex::dmc4rec::Log("OPEN {:08X} {}", uint32_t(handle), target_path);
 +    if (REXCVAR_GET(log_sound_io) && IsSoundPath(target_path)) {
 +      REXKRNL_INFO("SOUNDIO open '{}' handle={:#x} sync={} options={:#x}", target_path, handle,
 +                   file ? file->is_synchronous() : false, uint32_t(create_options));
@@ -14032,7 +14447,17 @@ index 3f1a852..1ed5123 100644
    }
    return result;
  }
-@@ -220,6 +306,20 @@ u32 NtReadFile_entry(u32 file_handle, u32 event_handle, mapped_void apc_routine_
+@@ -195,6 +283,9 @@ u32 NtReadFile_entry(u32 file_handle, u32 event_handle, mapped_void apc_routine_
+       (uint32_t)file_handle, (uint32_t)event_handle, apc_routine_ptr.guest_address(),
+       apc_context.guest_address(), io_status_block.guest_address(), buffer.guest_address(),
+       (uint32_t)buffer_length, byte_offset_ptr ? (int64_t)byte_offset : -1);
++  rex::dmc4rec::Log("READ {:08X} off {} len {}{}", uint32_t(file_handle),
++                    byte_offset_ptr ? int64_t(byte_offset) : -1, uint32_t(buffer_length),
++                    event_handle ? " async" : "");
+   X_STATUS result = X_STATUS_SUCCESS;
+   bool apc_queued = false;
+ 
+@@ -220,6 +311,20 @@ u32 NtReadFile_entry(u32 file_handle, u32 event_handle, mapped_void apc_routine_
          io_status_block->status = result;
          io_status_block->information = bytes_read;
        }
@@ -14328,6 +14753,45 @@ index 76cc877..6f34b9e 100644
  std::unique_lock<std::recursive_mutex> PhysicalHeap::AcquireHostPageReconcileLock() const {
    auto lock = BaseHeap::AcquireHostPageReconcileLock();
    if (!lock.owns_lock() && parent_heap_ && parent_heap_->page_size() < memory_->system_page_size_) {
+diff --git a/src/system/xobject.cpp b/src/system/xobject.cpp
+index d358f39..2d11b12 100644
+--- a/src/system/xobject.cpp
++++ b/src/system/xobject.cpp
+@@ -9,6 +9,7 @@
+  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
+  */
+ 
++#include <rex/audio/dmc4_recorder.h>
+ #include <vector>
+ 
+ #include <rex/chrono/clock.h>
+@@ -213,6 +214,7 @@ X_STATUS XObject::Wait(uint32_t wait_reason, uint32_t processor_mode, uint32_t a
+                                 : std::chrono::milliseconds::max();
+ 
+   XThread::CheckTitleTermination();
++  rex::dmc4rec::WaitScope rec_wait("wait", guest_object(), uint32_t(type()), 1, !opt_timeout);
+   auto result = rex::thread::Wait(wait_handle, alertable ? true : false, timeout_ms);
+   XThread::CheckTitleTermination();
+   switch (result) {
+@@ -239,6 +241,8 @@ X_STATUS XObject::SignalAndWait(XObject* signal_object, XObject* wait_object, ui
+                                       TimeoutTicksToMs(*opt_timeout)))
+                                 : std::chrono::milliseconds::max();
+ 
++  rex::dmc4rec::WaitScope rec_wait("signal+wait", wait_object->guest_object(),
++                                   uint32_t(wait_object->type()), 1, !opt_timeout);
+   auto result =
+       rex::thread::SignalAndWait(signal_object->GetWaitHandle(), wait_object->GetWaitHandle(),
+                                  alertable ? true : false, timeout_ms);
+@@ -273,6 +277,9 @@ X_STATUS XObject::WaitMultiple(uint32_t count, XObject** objects, uint32_t wait_
+                                 : std::chrono::milliseconds::max();
+ 
+   XThread::CheckTitleTermination();
++  rex::dmc4rec::WaitScope rec_wait(wait_type ? "wait-any" : "wait-all",
++                                   count ? objects[0]->guest_object() : 0,
++                                   count ? uint32_t(objects[0]->type()) : 0, count, !opt_timeout);
+   if (wait_type) {
+     auto result =
+         rex::thread::WaitAny(std::move(wait_handles), alertable ? true : false, timeout_ms);
 diff --git a/src/ui/CMakeLists.txt b/src/ui/CMakeLists.txt
 index 5bd3dc5..3733ea5 100644
 --- a/src/ui/CMakeLists.txt
