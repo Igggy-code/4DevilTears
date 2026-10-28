@@ -8179,7 +8179,7 @@ index 0000000..4812f2a
 +
 +}  // namespace rex::graphics::vulkan::bc_decode
 diff --git a/src/graphics/vulkan/command_processor.cpp b/src/graphics/vulkan/command_processor.cpp
-index 001f36b..76bcf4f 100644
+index 001f36b..c5e7a8f 100644
 --- a/src/graphics/vulkan/command_processor.cpp
 +++ b/src/graphics/vulkan/command_processor.cpp
 @@ -9,7 +9,10 @@
@@ -8245,7 +8245,7 @@ index 001f36b..76bcf4f 100644
  REXCVAR_DEFINE_BOOL(vulkan_async_skip_incomplete_frames, true, "GPU/Vulkan",
                      "When async shader compilation is enabled, skip presenting frames that "
                      "used placeholder pipelines to avoid visible flashing")
-@@ -69,6 +103,472 @@ REXCVAR_DEFINE_BOOL(vulkan_dynamic_rendering, true, "GPU/Vulkan",
+@@ -69,6 +103,602 @@ REXCVAR_DEFINE_BOOL(vulkan_dynamic_rendering, true, "GPU/Vulkan",
                      "device (falls back to render passes otherwise)")
      .lifecycle(rex::cvar::Lifecycle::kHotReload);
  
@@ -8303,7 +8303,7 @@ index 001f36b..76bcf4f 100644
 +                      "[4DevilTears] File for the UI layout capture (empty: the main log)");
 +// The host (game) registers its menu signature function: menu screen + cursor position.
 +static std::atomic<uint64_t (*)()> g_4dt_ui_signature_fn{nullptr};
-+extern "C" void Rex4dtSetUiSignatureFn(uint64_t (*fn)()) { g_4dt_ui_signature_fn.store(fn); }
++extern "C" __attribute__((visibility("default"))) void Rex4dtSetUiSignatureFn(uint64_t (*fn)()) { g_4dt_ui_signature_fn.store(fn); }
 +namespace {
 +struct Dmc4UiDrawCapture {
 +  bool logging = false;
@@ -8345,6 +8345,136 @@ index 001f36b..76bcf4f 100644
 +  }
 +}
 +}  // namespace
++
++// [4DevilTears] Touch menus: every 2D sprite the game's UI shader draws in a frame
++// (screen rectangle in 1280x720 game pixels, texture rectangle, texture, colour), published
++// at the frame swap for the touch layer - taps are matched against the sprites the game
++// really draws (list rows, value arrows, button prompts), on any screen.
++REXCVAR_DEFINE_BOOL(ui_touch_sprites, true, "GPU",
++                    "[4DevilTears] Collect the UI sprites of each frame for touch menus");
++namespace {
++constexpr uint64_t kDmc4UiSpriteVs = UINT64_C(0x835AD9A82995A342);
++constexpr int kDmc4UiSpriteInts = 11;
++constexpr size_t kDmc4UiSpritesMax = 768;
++std::vector<int32_t> g_ui_sprites_building;
++std::vector<int32_t> g_ui_sprites_published;
++std::mutex g_ui_sprites_mutex;
++uint32_t g_ui_sprites_frame = 0;
++uint32_t g_ui_sprite_draw = 0;
++}  // namespace
++
++extern "C" __attribute__((visibility("default"))) int Rex4dtUiSprites(int32_t* out, int max_sprites,
++                                                                      uint32_t* frame) {
++  std::lock_guard<std::mutex> lock(g_ui_sprites_mutex);
++  const int count = std::min<int>(max_sprites, int(g_ui_sprites_published.size() / kDmc4UiSpriteInts));
++  if (out && count > 0) {
++    std::memcpy(out, g_ui_sprites_published.data(), size_t(count) * kDmc4UiSpriteInts * 4);
++  }
++  if (frame) *frame = g_ui_sprites_frame;
++  return count;
++}
++
++static void Dmc4UiSpritesOnSwap() {
++  if (!REXCVAR_GET(ui_touch_sprites)) return;
++  {
++    std::lock_guard<std::mutex> lock(g_ui_sprites_mutex);
++    g_ui_sprites_published.swap(g_ui_sprites_building);
++    ++g_ui_sprites_frame;
++  }
++  g_ui_sprites_building.clear();
++  g_ui_sprite_draw = 0;
++}
++
++static void Dmc4UiSpritesDraw(const rex::graphics::RegisterFile& regs,
++                              rex::memory::Memory* memory, const rex::graphics::Shader* vs,
++                              uint32_t index_count, uint32_t ib_base,
++                              rex::graphics::xenos::IndexFormat ib_format,
++                              rex::graphics::xenos::Endian ib_endian) {
++  using namespace rex::graphics;
++  if (vs->ucode_data_hash() != kDmc4UiSpriteVs || vs->vertex_bindings().empty()) return;
++  if (index_count > 4096 ||
++      g_ui_sprites_building.size() >= kDmc4UiSpritesMax * kDmc4UiSpriteInts) {
++    return;
++  }
++  if (regs.Get<reg::RB_SURFACE_INFO>().surface_pitch != 1280) return;
++  const uint32_t draw = g_ui_sprite_draw++;
++  const auto& binding = vs->vertex_bindings()[0];
++  const uint32_t* vf =
++      &regs.values[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 + binding.fetch_constant * 2];
++  if ((vf[0] & 3) != uint32_t(xenos::FetchConstantType::kVertex)) return;
++  const uint32_t base = vf[0] & ~uint32_t(3);
++  const uint32_t size_words = (vf[1] >> 2) & 0xFFFFFF;
++  const auto endian = xenos::Endian(vf[1] & 3);
++  const uint32_t stride = binding.stride_words;
++  // Layout of this shader's vertices: xyz float, colour (8888), texcoord (16_16).
++  if (stride < 5) return;
++  const uint32_t* vb = memory->TranslatePhysical<const uint32_t*>(base);
++  if (!vb) return;
++  auto word = [&](uint32_t index) -> uint32_t {
++    return index < size_words ? xenos::GpuSwap(vb[index], endian) : 0;
++  };
++  uint32_t tex_base = 0;
++  {
++    const uint32_t* t = &regs.values[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0];
++    if ((t[0] & 3) == uint32_t(xenos::FetchConstantType::kTexture)) tex_base = t[1] & 0xFFFFF000u;
++  }
++  const uint32_t indx_offset = regs[XE_GPU_REG_VGT_INDX_OFFSET] & 0xFFFFFF;
++  const void* ib = ib_base ? memory->TranslatePhysical<const void*>(ib_base) : nullptr;
++  float x0 = 1e30f, y0 = 1e30f, x1 = -1e30f, y1 = -1e30f;
++  uint32_t u0 = 0xFFFF, v0 = 0xFFFF, u1 = 0, v1 = 0, color = 0;
++  uint32_t verts = 0;
++  auto flush = [&]() {
++    if (verts >= 3 && x1 > x0 && y1 > y0 &&
++        g_ui_sprites_building.size() < kDmc4UiSpritesMax * kDmc4UiSpriteInts) {
++      const int32_t s[kDmc4UiSpriteInts] = {
++          int32_t(std::lround(x0)), int32_t(std::lround(y0)), int32_t(std::lround(x1)),
++          int32_t(std::lround(y1)), int32_t(u0), int32_t(v0), int32_t(u1), int32_t(v1),
++          int32_t(tex_base >> 12), int32_t(color), int32_t(draw)};
++      g_ui_sprites_building.insert(g_ui_sprites_building.end(), s, s + kDmc4UiSpriteInts);
++    }
++    x0 = y0 = 1e30f;
++    x1 = y1 = -1e30f;
++    u0 = v0 = 0xFFFF;
++    u1 = v1 = 0;
++    verts = 0;
++  };
++  for (uint32_t i = 0; i < index_count; ++i) {
++    uint32_t v = i;
++    if (ib) {
++      if (ib_format == xenos::IndexFormat::kInt32) {
++        v = xenos::GpuSwap(static_cast<const uint32_t*>(ib)[i], ib_endian);
++        if (v == 0xFFFFFFFFu) {
++          flush();
++          continue;
++        }
++      } else {
++        v = xenos::GpuSwap(static_cast<const uint16_t*>(ib)[i], ib_endian);
++        if (v == 0xFFFFu) {
++          flush();
++          continue;
++        }
++      }
++    }
++    v = (v + indx_offset) & 0xFFFFFF;
++    const uint32_t wx = word(v * stride), wy = word(v * stride + 1);
++    float x, y;
++    std::memcpy(&x, &wx, 4);
++    std::memcpy(&y, &wy, 4);
++    if (!(std::abs(x) < 100000.0f) || !(std::abs(y) < 100000.0f)) continue;
++    const uint32_t uv = word(v * stride + 4);
++    if (verts == 0) color = word(v * stride + 3);
++    x0 = std::min(x0, x);
++    y0 = std::min(y0, y);
++    x1 = std::max(x1, x);
++    y1 = std::max(y1, y);
++    u0 = std::min(u0, uv >> 16);
++    v0 = std::min(v0, uv & 0xFFFF);
++    u1 = std::max(u1, uv >> 16);
++    v1 = std::max(v1, uv & 0xFFFF);
++    ++verts;
++  }
++  flush();
++}
 +
 +static void Dmc4UiCaptureOnSwap() {
 +  if (!REXCVAR_GET(ui_capture_draws)) return;
@@ -8718,7 +8848,7 @@ index 001f36b..76bcf4f 100644
  namespace rex::graphics::vulkan {
  
  namespace {
-@@ -580,6 +1080,7 @@ VulkanCommandProcessor::VulkanCommandProcessor(VulkanGraphicsSystem* graphics_sy
+@@ -580,6 +1210,7 @@ VulkanCommandProcessor::VulkanCommandProcessor(VulkanGraphicsSystem* graphics_sy
                                                 system::KernelState* kernel_state)
      : CommandProcessor(graphics_system, kernel_state),
        deferred_command_buffer_(*this),
@@ -8726,7 +8856,7 @@ index 001f36b..76bcf4f 100644
        transient_descriptor_allocator_uniform_buffer_(
            static_cast<const ui::vulkan::VulkanProvider*>(graphics_system->provider())
                ->vulkan_device(),
-@@ -930,10 +1431,17 @@ bool VulkanCommandProcessor::SetupContext() {
+@@ -930,10 +1561,17 @@ bool VulkanCommandProcessor::SetupContext() {
      return false;
    }
    if (!device_properties.vertexPipelineStoresAndAtomics) {
@@ -8748,7 +8878,7 @@ index 001f36b..76bcf4f 100644
    }
    if (!device_properties.geometryShader) {
      if (REXCVAR_GET(vulkan_require_geometry_shader)) {
-@@ -2057,7 +2565,12 @@ void VulkanCommandProcessor::ShutdownContext() {
+@@ -2057,7 +2695,12 @@ void VulkanCommandProcessor::ShutdownContext() {
    sparse_buffer_binds_.clear();
    sparse_memory_binds_.clear();
  
@@ -8761,7 +8891,7 @@ index 001f36b..76bcf4f 100644
    for (const auto& command_buffer_pair : command_buffers_submitted_) {
      dfn.vkDestroyCommandPool(device, command_buffer_pair.second.pool, nullptr);
    }
-@@ -2269,8 +2782,326 @@ void VulkanCommandProcessor::OnGammaRampPWLValueWritten() {
+@@ -2269,8 +2912,327 @@ void VulkanCommandProcessor::OnGammaRampPWLValueWritten() {
    gamma_ramp_pwl_current_frame_ = UINT32_MAX;
  }
  
@@ -9077,6 +9207,7 @@ index 001f36b..76bcf4f 100644
 +  g_4dt_heavy_frames = g_4dt_frame_draws >= 150 ? g_4dt_heavy_frames + 1 : 0;
 +  g_4dt_frame_draws = 0;
 +  Dmc4UiCaptureOnSwap();
++  Dmc4UiSpritesOnSwap();
 +  BandCollapseOnFrame();
 +  {
 +    static uint32_t swaps_since_cache_flush = 0;
@@ -9088,7 +9219,7 @@ index 001f36b..76bcf4f 100644
    SCOPE_profile_cpu_f("gpu");
    vertex_buffers_in_sync_[0] = 0;
    vertex_buffers_in_sync_[1] = 0;
-@@ -2292,6 +3123,19 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
+@@ -2292,6 +3254,19 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
    bool skip_present_due_async_placeholder = REXCVAR_GET(async_shader_compilation) &&
                                              REXCVAR_GET(vulkan_async_skip_incomplete_frames) &&
                                              frame_used_async_placeholder_pipeline_;
@@ -9108,7 +9239,7 @@ index 001f36b..76bcf4f 100644
    if (skip_present_due_async_placeholder) {
      static bool skipped_incomplete_frame_logged = false;
      if (!skipped_incomplete_frame_logged) {
-@@ -2855,7 +3699,8 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
+@@ -2855,7 +3830,8 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
            render_pass_begin_info.renderArea.extent.height = guest_output_height;
            render_pass_begin_info.clearValueCount = 0;
            render_pass_begin_info.pClearValues = nullptr;
@@ -9118,7 +9249,7 @@ index 001f36b..76bcf4f 100644
                                                          VK_SUBPASS_CONTENTS_INLINE);
  
            VkViewport viewport;
-@@ -3091,13 +3936,22 @@ bool VulkanCommandProcessor::SubmitBarriers(bool force_end_render_pass) {
+@@ -3091,13 +4067,22 @@ bool VulkanCommandProcessor::SubmitBarriers(bool force_end_render_pass) {
  void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
      VkRenderPass render_pass, const VulkanRenderTargetCache::Framebuffer* framebuffer) {
    SubmitBarriers(false);
@@ -9142,7 +9273,7 @@ index 001f36b..76bcf4f 100644
        return;
      }
    } else {
-@@ -3107,16 +3961,23 @@ void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
+@@ -3107,16 +4092,23 @@ void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
    }
  
    if (in_render_pass_) {
@@ -9166,7 +9297,7 @@ index 001f36b..76bcf4f 100644
  
    if (use_dynamic_rendering) {
      VkRenderingAttachmentInfo color_attachments[xenos::kMaxColorRenderTargets];
-@@ -3141,7 +4002,11 @@ void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
+@@ -3141,7 +4133,11 @@ void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
      rendering_info.pColorAttachments = color_attachment_count ? color_attachments : nullptr;
      rendering_info.pDepthAttachment = has_depth ? &depth_attachment : nullptr;
      rendering_info.pStencilAttachment = has_stencil ? &stencil_attachment : nullptr;
@@ -9178,7 +9309,7 @@ index 001f36b..76bcf4f 100644
    } else {
      VkRenderPassBeginInfo render_pass_begin_info;
      render_pass_begin_info.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
-@@ -3155,10 +4020,14 @@ void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
+@@ -3155,10 +4151,14 @@ void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
      render_pass_begin_info.renderArea.extent = framebuffer->host_extent;
      render_pass_begin_info.clearValueCount = 0;
      render_pass_begin_info.pClearValues = nullptr;
@@ -9193,7 +9324,7 @@ index 001f36b..76bcf4f 100644
  }
  
  void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
-@@ -3171,7 +4040,8 @@ void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
+@@ -3171,7 +4171,8 @@ void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
  
    if (use_dynamic_rendering) {
      if (in_render_pass_ && current_framebuffer_ == framebuffer &&
@@ -9203,7 +9334,7 @@ index 001f36b..76bcf4f 100644
        return;
      }
    } else {
-@@ -3181,16 +4051,23 @@ void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
+@@ -3181,16 +4182,23 @@ void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
    }
  
    if (in_render_pass_) {
@@ -9227,7 +9358,7 @@ index 001f36b..76bcf4f 100644
  
    if (use_dynamic_rendering) {
      VkRenderingAttachmentInfo color_attachment = {};
-@@ -3235,6 +4112,9 @@ void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
+@@ -3235,6 +4243,9 @@ void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
      rendering_info.pColorAttachments = transfer_dest_is_depth ? nullptr : &color_attachment;
      rendering_info.pDepthAttachment = transfer_dest_is_depth ? &depth_attachment : nullptr;
      rendering_info.pStencilAttachment = transfer_dest_is_depth ? &stencil_attachment : nullptr;
@@ -9237,7 +9368,7 @@ index 001f36b..76bcf4f 100644
      deferred_command_buffer_.CmdVkBeginRendering(&rendering_info);
    } else {
      VkRenderPassBeginInfo render_pass_begin_info;
-@@ -3247,10 +4127,329 @@ void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
+@@ -3247,10 +4258,329 @@ void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
      render_pass_begin_info.renderArea.extent = framebuffer->host_extent;
      render_pass_begin_info.clearValueCount = 0;
      render_pass_begin_info.pClearValues = nullptr;
@@ -9567,7 +9698,7 @@ index 001f36b..76bcf4f 100644
  }
  
  void VulkanCommandProcessor::EndRenderPass() {
-@@ -3258,13 +4457,20 @@ void VulkanCommandProcessor::EndRenderPass() {
+@@ -3258,13 +4588,20 @@ void VulkanCommandProcessor::EndRenderPass() {
    if (!in_render_pass_) {
      return;
    }
@@ -9588,7 +9719,7 @@ index 001f36b..76bcf4f 100644
    in_render_pass_ = false;
  }
  
-@@ -3587,13 +4793,244 @@ Shader* VulkanCommandProcessor::LoadShader(xenos::ShaderType shader_type, uint32
+@@ -3587,13 +4924,244 @@ Shader* VulkanCommandProcessor::LoadShader(xenos::ShaderType shader_type, uint32
    return pipeline_cache_->LoadShader(shader_type, host_address, dword_count);
  }
  
@@ -9834,10 +9965,16 @@ index 001f36b..76bcf4f 100644
    const RegisterFile& regs = *register_file_;
    (void)index_buffer_info;
    auto draw_fail = [&](const char* stage) {
-@@ -3629,13 +5066,62 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
+@@ -3629,13 +5197,68 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
      return draw_fail("missing_vertex_shader");
    }
    pipeline_cache_->AnalyzeShaderUcode(*vertex_shader);
++  if (REXCVAR_GET(ui_touch_sprites)) {
++    Dmc4UiSpritesDraw(regs, memory_, vertex_shader, index_count,
++                      index_buffer_info ? index_buffer_info->guest_base : 0,
++                      index_buffer_info ? index_buffer_info->format : xenos::IndexFormat::kInt16,
++                      index_buffer_info ? index_buffer_info->endianness : xenos::Endian::kNone);
++  }
 +  if (REXCVAR_GET(ui_capture_draws)) {
 +    Dmc4UiCaptureDraw(regs, memory_, vertex_shader, active_pixel_shader(), prim_type, index_count,
 +                      index_buffer_info ? index_buffer_info->guest_base : 0,
@@ -9901,7 +10038,7 @@ index 001f36b..76bcf4f 100644
      }
      draw_util::AddMemExportRanges(regs, *vertex_shader, memexport_ranges_);
    }
-@@ -3681,6 +5167,365 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
+@@ -3681,6 +5304,365 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
    }
    reg::RB_DEPTHCONTROL normalized_depth_control = draw_util::GetNormalizedDepthControl(regs);
  
@@ -10267,7 +10404,7 @@ index 001f36b..76bcf4f 100644
    uint32_t ps_param_gen_pos = UINT32_MAX;
    uint32_t interpolator_mask =
        pixel_shader ? (vertex_shader->writes_interpolators() &
-@@ -3835,6 +5680,7 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
+@@ -3835,6 +5817,7 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
    uint32_t used_texture_mask =
        vertex_shader->GetUsedTextureMaskAfterTranslation() |
        (pixel_shader != nullptr ? pixel_shader->GetUsedTextureMaskAfterTranslation() : 0);
@@ -10275,7 +10412,7 @@ index 001f36b..76bcf4f 100644
    texture_cache_->RequestTextures(used_texture_mask);
  
    const VulkanPipelineCache::PipelineLayoutProvider* pipeline_layout_provider;
-@@ -4111,14 +5957,22 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
+@@ -4111,14 +6094,22 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
    // After all commands that may dispatch, copy or insert barriers, submit
    // the barriers (may end the render pass), and (re)enter the render pass
    // before drawing.
@@ -10298,7 +10435,7 @@ index 001f36b..76bcf4f 100644
      deferred_command_buffer_.CmdVkDraw(primitive_processing_result.host_draw_vertex_count, 1, 0, 0);
    } else {
      std::pair<VkBuffer, VkDeviceSize> index_buffer;
-@@ -4150,10 +6004,33 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
+@@ -4150,10 +6141,33 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
          primitive_processing_result.host_index_format == xenos::IndexFormat::kInt16
              ? VK_INDEX_TYPE_UINT16
              : VK_INDEX_TYPE_UINT32);
@@ -10332,7 +10469,7 @@ index 001f36b..76bcf4f 100644
    // Invalidate textures in memexported memory and watch for changes.
    if (!memexport_ranges_.empty()) {
      for (const draw_util::MemExportRange& memexport_range : memexport_ranges_) {
-@@ -4382,6 +6259,63 @@ bool VulkanCommandProcessor::IssueDraw_MemexportReadbackFastPath(uint32_t total_
+@@ -4382,6 +6396,63 @@ bool VulkanCommandProcessor::IssueDraw_MemexportReadbackFastPath(uint32_t total_
  }
  
  bool VulkanCommandProcessor::IssueCopy() {
@@ -10396,7 +10533,7 @@ index 001f36b..76bcf4f 100644
  #if XE_GPU_FINE_GRAINED_DRAW_SCOPES
    SCOPE_profile_cpu_f("gpu");
  #endif  // XE_GPU_FINE_GRAINED_DRAW_SCOPES
-@@ -4393,8 +6327,22 @@ bool VulkanCommandProcessor::IssueCopy() {
+@@ -4393,8 +6464,22 @@ bool VulkanCommandProcessor::IssueCopy() {
    ReadbackResolveMode readback_mode = GetReadbackResolveMode(REXCVAR_GET(vulkan_readback_resolve));
    if (readback_mode == ReadbackResolveMode::kDisabled) {
      uint32_t written_address, written_length;
@@ -10421,7 +10558,7 @@ index 001f36b..76bcf4f 100644
    }
  
    return IssueCopy_ReadbackResolvePath();
-@@ -5016,6 +6964,77 @@ void VulkanCommandProcessor::CheckSubmissionFenceAndDeviceLoss(uint64_t await_su
+@@ -5016,6 +7101,77 @@ void VulkanCommandProcessor::CheckSubmissionFenceAndDeviceLoss(uint64_t await_su
                                        submissions_in_flight_fences_awaited_end);
    submission_completed_ += fences_awaited;
  
@@ -10499,7 +10636,7 @@ index 001f36b..76bcf4f 100644
    // Reclaim semaphores.
    while (!submissions_in_flight_semaphores_.empty()) {
      const auto& semaphore_submission = submissions_in_flight_semaphores_.front();
-@@ -5136,6 +7155,29 @@ bool VulkanCommandProcessor::BeginSubmission(bool is_guest_command) {
+@@ -5136,6 +7292,29 @@ bool VulkanCommandProcessor::BeginSubmission(bool is_guest_command) {
      // the end of the submission (when async pipeline object creation requests
      // are fulfilled).
      deferred_command_buffer_.Reset();
@@ -10529,7 +10666,7 @@ index 001f36b..76bcf4f 100644
  
      // Reset cached state of the command buffer.
      dynamic_viewport_update_needed_ = true;
-@@ -5150,6 +7192,7 @@ bool VulkanCommandProcessor::BeginSubmission(bool is_guest_command) {
+@@ -5150,6 +7329,7 @@ bool VulkanCommandProcessor::BeginSubmission(bool is_guest_command) {
      dynamic_stencil_reference_back_update_needed_ = true;
      current_render_pass_ = VK_NULL_HANDLE;
      current_framebuffer_ = nullptr;
@@ -10537,7 +10674,7 @@ index 001f36b..76bcf4f 100644
      in_render_pass_ = false;
      current_guest_graphics_pipeline_ = VK_NULL_HANDLE;
      current_external_graphics_pipeline_ = VK_NULL_HANDLE;
-@@ -5385,7 +7428,81 @@ bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
+@@ -5385,7 +7565,81 @@ bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
        REXGPU_ERROR("Failed to begin a Vulkan command buffer");
        return false;
      }
