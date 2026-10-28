@@ -1375,10 +1375,10 @@ index 7a711a8..d2eec33 100644
    assert_true(clients_[index].driver != NULL);
 diff --git a/src/audio/dmc4_recorder.cpp b/src/audio/dmc4_recorder.cpp
 new file mode 100644
-index 0000000..0ac1116
+index 0000000..e0bb9a7
 --- /dev/null
 +++ b/src/audio/dmc4_recorder.cpp
-@@ -0,0 +1,371 @@
+@@ -0,0 +1,397 @@
 +// [4DevilTears] Debug recorder - see rex/audio/dmc4_recorder.h.
 +#include <rex/audio/dmc4_recorder.h>
 +
@@ -1498,15 +1498,22 @@ index 0000000..0ac1116
 +    s.frames[0] = uc->uc_mcontext.pc;
 +    s.frames[1] = uc->uc_mcontext.regs[30];
 +    uintptr_t fp = uc->uc_mcontext.regs[29];
++    const uintptr_t sp = uc->uc_mcontext.sp;
 +#elif defined(__x86_64__)
 +    s.frames[0] = uc->uc_mcontext.gregs[REG_RIP];
 +    s.frames[1] = 0;
 +    uintptr_t fp = uc->uc_mcontext.gregs[REG_RBP];
++    const uintptr_t sp = uc->uc_mcontext.gregs[REG_RSP];
 +#else
 +    uintptr_t fp = 0;
++    const uintptr_t sp = 0;
 +#endif
++    // Only frame pointers inside this thread's live stack (code built without frame
++    // pointers - GPU driver, ART - keeps other values in x29: never dereference those).
++    const uintptr_t stack_end = sp + (256u << 10);
 +    for (int k = 2; k < 10; ++k) {
-+      if (!fp || (fp & 7)) {
++      if (!fp || (fp & 7) || fp < sp || fp + 16 > stack_end) {
++        fp = 0;
 +        s.frames[k] = 0;
 +        continue;
 +      }
@@ -1675,7 +1682,26 @@ index 0000000..0ac1116
 +  if (auto* ts = rex::runtime::ThreadState::Get()) {
 +    if (ts->context()) lr = uint32_t(ts->context()->lr);
 +  }
-+  Line(fmt::format("SYNC {} obj {:08X} {:X} t{:X} lr {:08X}", what, object, extra, tid, lr));
++  // The same call from the same place repeats every few ms (audio callbacks): one line per
++  // 250 ms with the number of repeats.
++  static std::mutex sync_mutex;
++  static std::unordered_map<uint64_t, std::pair<int64_t, uint32_t>> last;
++  const uint64_t key = (uint64_t(object) << 32) ^ (uint64_t(lr) << 8) ^ tid ^
++                       (uint64_t(reinterpret_cast<uintptr_t>(what)) << 3);
++  const int64_t now = NowUs();
++  uint32_t repeats = 0;
++  {
++    std::lock_guard<std::mutex> lock(sync_mutex);
++    auto& entry = last[key];
++    if (entry.first && now - entry.first < 250000) {
++      ++entry.second;
++      return;
++    }
++    repeats = entry.second;
++    entry = {now, 0};
++  }
++  Line(fmt::format("SYNC {} obj {:08X} {:X} t{:X} lr {:08X}{}", what, object, extra, tid, lr,
++                   repeats ? fmt::format(" (+{} since)", repeats) : std::string()));
 +}
 +
 +void AddTick(TickFn fn, void* user) {
