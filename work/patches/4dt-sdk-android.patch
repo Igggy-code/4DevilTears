@@ -7978,7 +7978,7 @@ index 0000000..4812f2a
 +
 +}  // namespace rex::graphics::vulkan::bc_decode
 diff --git a/src/graphics/vulkan/command_processor.cpp b/src/graphics/vulkan/command_processor.cpp
-index 001f36b..4f25ba6 100644
+index 001f36b..bf20708 100644
 --- a/src/graphics/vulkan/command_processor.cpp
 +++ b/src/graphics/vulkan/command_processor.cpp
 @@ -10,6 +10,8 @@
@@ -8086,7 +8086,7 @@ index 001f36b..4f25ba6 100644
 +                    "[4DevilTears] Reload all textures when a frame trace starts (host dumps); "
 +                    "false shows only the texture loads the frame really does");
 +// [4deviltears] High-level emulation of the XDK D3DDevice_Clear draw (see IssueDraw).
-+REXCVAR_DEFINE_BOOL(d3d_clear_hle, false, "GPU",
++REXCVAR_DEFINE_BOOL(d3d_clear_hle, true, "GPU",
 +                    "Perform XDK D3D Clear rectangle draws as host render target clears on the "
 +                    "render targets currently owning the EDRAM range (avoids render target "
 +                    "ownership transfers between MSAA layouts)");
