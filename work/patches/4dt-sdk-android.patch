@@ -65,10 +65,10 @@ index 41e6dce..a7e4a32 100644
      endif()
 diff --git a/include/rex/audio/dmc4_recorder.h b/include/rex/audio/dmc4_recorder.h
 new file mode 100644
-index 0000000..219553b
+index 0000000..d8b9325
 --- /dev/null
 +++ b/include/rex/audio/dmc4_recorder.h
-@@ -0,0 +1,42 @@
+@@ -0,0 +1,46 @@
 +// [4DevilTears] Debug recorder: switched on by hand (a button / gesture in the app, or a
 +// runner job) right before a known problem spot. While on, subsystems write compact state
 +// lines into a separate file: audio (XMA contexts, audio clients), kernel waits that last,
@@ -94,6 +94,10 @@ index 0000000..219553b
 +// Something called every ~500 ms by the watchdog while recording (state summaries).
 +using TickFn = void (*)(void* user);
 +DMC4REC_API void AddTick(TickFn fn, void* user);
++
++// A guest synchronization call on a game-static object (event set / reset / semaphore
++// release / multi-object wait): logged with the calling thread and guest return address.
++DMC4REC_API void Sync(const char* what, uint32_t object, uint32_t extra = 0);
 +
 +// A guest wait in progress (the watchdog reports the ones that take long).
 +class DMC4REC_API WaitScope {
@@ -1327,10 +1331,10 @@ index 7a711a8..d2eec33 100644
    assert_true(clients_[index].driver != NULL);
 diff --git a/src/audio/dmc4_recorder.cpp b/src/audio/dmc4_recorder.cpp
 new file mode 100644
-index 0000000..865b684
+index 0000000..3aea380
 --- /dev/null
 +++ b/src/audio/dmc4_recorder.cpp
-@@ -0,0 +1,325 @@
+@@ -0,0 +1,336 @@
 +// [4DevilTears] Debug recorder - see rex/audio/dmc4_recorder.h.
 +#include <rex/audio/dmc4_recorder.h>
 +
@@ -1582,6 +1586,17 @@ index 0000000..865b684
 +  std::lock_guard<std::mutex> lock(g_file_mutex);
 +  if (!g_file) return;
 +  std::fprintf(g_file, "%8lld %s\n", (long long)Ms(), text.c_str());
++}
++
++void Sync(const char* what, uint32_t object, uint32_t extra) {
++  if (!On()) return;
++  if (object < 0x82000000u || object >= 0x83000000u) return;  // the game's static data only
++  uint32_t tid = 0, lr = 0;
++  if (auto* thread = rex::system::XThread::GetCurrentThread()) tid = thread->thread_id();
++  if (auto* ts = rex::runtime::ThreadState::Get()) {
++    if (ts->context()) lr = uint32_t(ts->context()->lr);
++  }
++  Line(fmt::format("SYNC {} obj {:08X} {:X} t{:X} lr {:08X}", what, object, extra, tid, lr));
 +}
 +
 +void AddTick(TickFn fn, void* user) {
@@ -14643,6 +14658,63 @@ index 5709e6d..7497b8d 100644
    REXKRNL_IMPORT_RESULT("NtClose", "{:#x}", result);
    return result;
  }
+diff --git a/src/kernel/xboxkrnl/xboxkrnl_threading.cpp b/src/kernel/xboxkrnl/xboxkrnl_threading.cpp
+index 57fd161..4205819 100644
+--- a/src/kernel/xboxkrnl/xboxkrnl_threading.cpp
++++ b/src/kernel/xboxkrnl/xboxkrnl_threading.cpp
+@@ -12,6 +12,7 @@
+ // Disable warnings about unused parameters for kernel functions
+ #pragma GCC diagnostic ignored "-Wunused-parameter"
+ 
++#include <rex/audio/dmc4_recorder.h>
+ #include <algorithm>
+ #include <atomic>
+ #include <chrono>
+@@ -473,10 +474,12 @@ uint32_t xeKeSetEvent(X_KEVENT* event_ptr, uint32_t increment, uint32_t wait) {
+ }
+ 
+ u32 KeSetEvent_entry(ppc_ptr_t<X_KEVENT> event_ptr, u32 increment, u32 wait) {
++  rex::dmc4rec::Sync("set", event_ptr.guest_address());
+   return xeKeSetEvent(event_ptr, increment, wait);
+ }
+ 
+ u32 KePulseEvent_entry(ppc_ptr_t<X_KEVENT> event_ptr, u32 increment, u32 wait) {
++  rex::dmc4rec::Sync("pulse", event_ptr.guest_address());
+   auto ev = XObject::GetNativeObject<XEvent>(REX_KERNEL_STATE(), event_ptr);
+   if (!ev) {
+     assert_always();
+@@ -487,6 +490,7 @@ u32 KePulseEvent_entry(ppc_ptr_t<X_KEVENT> event_ptr, u32 increment, u32 wait) {
+ }
+ 
+ u32 KeResetEvent_entry(ppc_ptr_t<X_KEVENT> event_ptr) {
++  rex::dmc4rec::Sync("reset", event_ptr.guest_address());
+   auto ev = XObject::GetNativeObject<XEvent>(REX_KERNEL_STATE(), event_ptr);
+   if (!ev) {
+     assert_always();
+@@ -613,6 +617,7 @@ uint32_t xeKeReleaseSemaphore(X_KSEMAPHORE* semaphore_ptr, uint32_t increment, u
+ 
+ u32 KeReleaseSemaphore_entry(ppc_ptr_t<X_KSEMAPHORE> semaphore_ptr, u32 increment, u32 adjustment,
+                              u32 wait) {
++  rex::dmc4rec::Sync("release", semaphore_ptr.guest_address(), adjustment);
+   return xeKeReleaseSemaphore(semaphore_ptr, increment, adjustment, wait);
+ }
+ 
+@@ -838,6 +843,7 @@ uint32_t xeKeWaitForSingleObject(void* object_ptr, uint32_t wait_reason, uint32_
+ 
+ u32 KeWaitForSingleObject_entry(mapped_void object_ptr, u32 wait_reason, u32 processor_mode,
+                                 u32 alertable, mapped_u64 timeout_ptr) {
++  rex::dmc4rec::Sync("wait", object_ptr.guest_address());
+   uint64_t timeout = timeout_ptr ? static_cast<uint64_t>(*timeout_ptr) : 0u;
+   // REXKRNL_IMPORT_TRACE("KeWaitForSingleObject", "obj={:#x} reason={} mode={} alertable={}
+   // timeout={}",
+@@ -875,6 +881,7 @@ u32 KeWaitForMultipleObjects_entry(u32 count, mapped_u32 objects_ptr, u32 wait_t
+ 
+   std::vector<object_ref<XObject>> objects;
+   for (uint32_t n = 0; n < count; n++) {
++    rex::dmc4rec::Sync(wait_type ? "wait-any" : "wait-all", uint32_t(objects_ptr[n]), n);
+     auto object_ptr = REX_KERNEL_MEMORY()->TranslateVirtual(objects_ptr[n]);
+     auto object_ref = XObject::GetNativeObject<XObject>(REX_KERNEL_STATE(), object_ptr);
+     if (!object_ref) {
 diff --git a/src/rexglue/main.cpp b/src/rexglue/main.cpp
 index 201b623..787e894 100644
 --- a/src/rexglue/main.cpp
