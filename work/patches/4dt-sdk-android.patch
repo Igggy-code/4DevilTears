@@ -9797,10 +9797,10 @@ index b49e033..c3c647a 100644
  
 diff --git a/src/graphics/vulkan/fast_resolve.cpp b/src/graphics/vulkan/fast_resolve.cpp
 new file mode 100644
-index 0000000..0271dbe
+index 0000000..0250415
 --- /dev/null
 +++ b/src/graphics/vulkan/fast_resolve.cpp
-@@ -0,0 +1,603 @@
+@@ -0,0 +1,625 @@
 +/**
 + * [4deviltears] Fast resolves for the Vulkan render target cache.
 + *
@@ -9823,6 +9823,7 @@ index 0000000..0271dbe
 +#include <cmath>
 +#include <string>
 +#include <vector>
++#include <unordered_set>
 +
 +#include <rex/cvar.h>
 +#include <rex/graphics/flags.h>
@@ -9832,6 +9833,12 @@ index 0000000..0271dbe
 +#include <rex/logging.h>
 +#include <rex/ui/vulkan/util.h>
 +
++namespace {
++// [4DevilTears] Fast resolve destinations whose memory is also read as other textures: they
++// keep the fast path, but the regular resolve runs too (outside the public headers).
++std::unordered_set<uint32_t> g_overlap_read_aliases;
++}  // namespace
++
 +REXCVAR_DEFINE_INT32(fast_resolve, 2, "GPU",
 +                     "Resolves straight from render targets into host images: 0 = off, 1 = in "
 +                     "addition to the regular resolve, 2 = skip the regular resolve for "
@@ -9839,6 +9846,12 @@ index 0000000..0271dbe
 +    .range(0, 2)
 +    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 +
++REXCVAR_DEFINE_BOOL(fast_resolve_overlap_dual, true, "GPU",
++                    "[4DevilTears] When another texture overlaps a fast resolve destination, "
++                    "keep the fast path for the destination texture itself and also run the "
++                    "regular resolve (for the overlapping reader) instead of dropping the fast "
++                    "path - saves the untiling texture load of the destination")
++    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 +REXCVAR_DEFINE_BOOL(fast_resolve_single_source, false, "GPU",
 +                    "[4DevilTears] Fast resolve only for textures written from one render "
 +                    "target per frame")
@@ -10036,6 +10049,14 @@ index 0000000..0271dbe
 +      continue;
 +    }
 +    if (start < alias.address + alias.extent_length && alias.address < start + length) {
++      if (REXCVAR_GET(fast_resolve_overlap_dual)) {
++        if (g_overlap_read_aliases.insert(alias.address).second) {
++          REXGPU_INFO("Fast resolve: {:08X} ({}x{}) is also read as a different texture "
++                      "{:08X}+{:X} - fast path kept, regular resolve also runs",
++                      alias.address, alias.width, alias.height, start, length);
++        }
++        continue;
++      }
 +      alias.incompatible = true;
 +      REXGPU_INFO("Fast resolve: {:08X} ({}x{}) is also read as a different texture "
 +                  "{:08X}+{:X} - keeping the regular resolve for it",
@@ -10394,7 +10415,8 @@ index 0000000..0271dbe
 +  bool covers_consumed = alias->covered_x0 == 0 && alias->covered_y0 == 0 &&
 +                         alias->covered_x1 >= alias->consumed_width &&
 +                         alias->covered_y1 >= alias->consumed_height;
-+  legacy_needed_out = mode_setting < 2 || !alias->compatible || !covers_consumed;
++  legacy_needed_out = mode_setting < 2 || !alias->compatible || !covers_consumed ||
++                      g_overlap_read_aliases.count(alias->address) != 0;
 +  if (frame_trace::Active()) {
 +    frame_trace::Line("  fast resolve %08X %ux%u src %d,%d dst %u,%u mode %u legacy %u", address,
 +                      width, height, src_x, src_y, dst_x,
