@@ -106,6 +106,11 @@ collect_logs() {
 }
 
 if [ "${LOGS:-0}" = "1" ]; then collect_logs; echo "LOGS_DONE"; exit 0; fi
+if [ "${REC:-0}" = "1" ]; then
+  # Включить / выключить запись отладки (то же, что кнопка REC в игре).
+  "$ADB" shell run-as $PKG touch files/rec_toggle
+  sleep 2; echo "REC_TOGGLED"; exit 0
+fi
 if [ "${SHOT:-0}" = "1" ]; then
   # Снимок текущего экрана телефона + запись того, что игра рисует в этом кадре.
   OUTD="$WORK/logs/shots"; mkdir -p "$OUTD"; T="$(date +%H%M%S)"
@@ -118,11 +123,22 @@ if [ "${UI_PULL:-0}" = "1" ]; then
   OUTD="$WORK/logs/ui_pull_$(date +%m%d_%H%M)${LOGTAG}"; mkdir -p "$OUTD"
   "$ADB" shell run-as $PKG ls -la files > "$OUTD/files.txt" 2>&1
   "$ADB" exec-out run-as $PKG sh -c "'cd files && ls ui_*.png 2>/dev/null | xargs tar -cf -'" | tar -xf - -C "$OUTD" 2>/dev/null
+  # Снимки кнопок UI / GFX (ui_*.png, gfx_*.png, gfx_*.txt - кадр видеочипа): забрать и удалить.
+  for f in $("$ADB" shell run-as $PKG ls files | tr -d '\r' | grep -E '^(ui_[0-9]+\.png|gfx_[0-9_]+\.(png|txt))$'); do
+    "$ADB" exec-out run-as $PKG cat "files/$f" > "$OUTD/$f" 2>/dev/null
+    [ -s "$OUTD/$f" ] && "$ADB" shell run-as $PKG rm -f "files/$f"
+  done
+  echo "== снимки UI: $(ls "$OUTD" | grep -c '^ui_.*png'), GFX: $(ls "$OUTD" | grep -c '^gfx_.*png'), кадров GPU: $(ls "$OUTD" | grep -c '^gfx_.*txt')"
   "$ADB" exec-out run-as $PKG cat files/dmc4.log > "$OUTD/dmc4.log" 2>/dev/null
   "$ADB" exec-out run-as $PKG cat files/dmc4.1.log > "$OUTD/dmc4.1.log" 2>/dev/null
   "$ADB" exec-out run-as $PKG cat files/args.txt > "$OUTD/args.txt" 2>/dev/null
   "$ADB" exec-out run-as $PKG cat files/ui_taps.txt > "$OUTD/ui_taps.txt" 2>/dev/null
   "$ADB" exec-out run-as $PKG cat files/ui_frames.txt > "$OUTD/ui_frames.txt" 2>/dev/null
+  for f in $("$ADB" shell run-as $PKG ls files | tr -d '\r' | grep '^rec_.*\.txt$'); do
+    "$ADB" exec-out run-as $PKG cat "files/$f" > "$OUTD/$f" 2>/dev/null
+    [ -s "$OUTD/$f" ] && "$ADB" shell run-as $PKG rm -f "files/$f"
+  done
+  echo "== записи отладки: $(ls "$OUTD" | grep -c '^rec_')"
   "$ADB" shell run-as $PKG rm -f files/ui_frames.txt files/ui_taps.txt
   "$ADB" logcat -d -s 4DevilTearsTouch:I 4DevilTears:I 4DevilTearsUi:I > "$OUTD/logcat.txt" 2>/dev/null
   echo "UI_PULL_DONE $OUTD"; exit 0
