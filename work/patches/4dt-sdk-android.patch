@@ -2785,10 +2785,10 @@ index e2983a4..5df6034 100644
  REXCVAR_DEFINE_BOOL(depth_float24_convert_in_pixel_shader, false, "GPU",
                      "Convert float24 depth in pixel shader");
 diff --git a/src/graphics/pipeline/render_target/cache.cpp b/src/graphics/pipeline/render_target/cache.cpp
-index 953c5fd..653a5d2 100644
+index 953c5fd..eddf98a 100644
 --- a/src/graphics/pipeline/render_target/cache.cpp
 +++ b/src/graphics/pipeline/render_target/cache.cpp
-@@ -27,6 +27,35 @@
+@@ -27,6 +27,37 @@
  #include <rex/graphics/xenos.h>
  #include <rex/logging.h>
  #include <rex/math.h>
@@ -2810,10 +2810,12 @@ index 953c5fd..653a5d2 100644
 +uint64_t g_4dt_draw_serial = 0;
 +uint64_t g_4dt_uniform_clear_draw = UINT64_MAX;
 +}
-+REXCVAR_DEFINE_BOOL(rt_uniform_clear_fill, true, "GPU",
++REXCVAR_DEFINE_BOOL(rt_uniform_clear_fill, false, "GPU",
 +                    "[4DevilTears] A transfer out of a render target that only holds a clear "
 +                    "value (XDK clear, e.g. through the 4x MSAA surface of the same EDRAM) into "
-+                    "one of the same format is done as a clear of the destination")
++                    "one of the same format is done as a clear of the destination. Off: in "
++                    "rooms drawn in two predicated tiling bands the recorded value was wrong - "
++                    "the first band stayed a solid green fill with every draw depth-rejected")
 +    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 +REXCVAR_DEFINE_BOOL(rt_skip_transfers_before_overwrite, true, "GPU",
 +                    "[4DevilTears] No ownership transfer into a render target that the current "
@@ -2824,7 +2826,7 @@ index 953c5fd..653a5d2 100644
  
  REXCVAR_DEFINE_BOOL(mrt_edram_used_range_clamp_to_min, true, "GPU",
                      "Clamp MRT EDRAM used range to minimum");
-@@ -397,6 +426,47 @@ void RenderTargetCache::BeginFrame() {
+@@ -397,6 +428,47 @@ void RenderTargetCache::BeginFrame() {
    ResetAccumulatedRenderTargets();
  }
  
@@ -2872,7 +2874,7 @@ index 953c5fd..653a5d2 100644
  bool RenderTargetCache::Update(bool is_rasterization_done,
                                 reg::RB_DEPTHCONTROL normalized_depth_control,
                                 uint32_t normalized_color_mask, const Shader& vertex_shader) {
-@@ -695,6 +765,125 @@ bool RenderTargetCache::Update(bool is_rasterization_done,
+@@ -695,6 +767,125 @@ bool RenderTargetCache::Update(bool is_rasterization_done,
      return true;
    }
  
