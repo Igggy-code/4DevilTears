@@ -9130,7 +9130,7 @@ index 0000000..4812f2a
 +
 +}  // namespace rex::graphics::vulkan::bc_decode
 diff --git a/src/graphics/vulkan/command_processor.cpp b/src/graphics/vulkan/command_processor.cpp
-index 001f36b..4ee7c3f 100644
+index 001f36b..4dcb883 100644
 --- a/src/graphics/vulkan/command_processor.cpp
 +++ b/src/graphics/vulkan/command_processor.cpp
 @@ -9,7 +9,10 @@
@@ -10882,7 +10882,7 @@ index 001f36b..4ee7c3f 100644
    in_render_pass_ = false;
  }
  
-@@ -3587,13 +5136,415 @@ Shader* VulkanCommandProcessor::LoadShader(xenos::ShaderType shader_type, uint32
+@@ -3587,13 +5136,428 @@ Shader* VulkanCommandProcessor::LoadShader(xenos::ShaderType shader_type, uint32
    return pipeline_cache_->LoadShader(shader_type, host_address, dword_count);
  }
  
@@ -11082,15 +11082,17 @@ index 001f36b..4ee7c3f 100644
 +struct PrepassState {
 +  std::unordered_set<uint64_t> color_keys_previous, color_keys_current;
 +  std::unordered_set<uint64_t> unsafe_previous, unsafe_current;
-+  uint64_t skipped = 0, frames = 0;
++  uint64_t skipped = 0, kept = 0, frames = 0;
 +  void OnFrame() {
 +    color_keys_previous.swap(color_keys_current);
 +    color_keys_current.clear();
 +    unsafe_previous.swap(unsafe_current);
 +    unsafe_current.clear();
 +    if (++frames % 600 == 0 && REXCVAR_GET(skip_depth_prepass)) {
-+      REXGPU_INFO("PREPASS skipped {:.1f} draws/frame", double(skipped) / 600.0);
++      REXGPU_INFO("PREPASS skipped {:.1f} kept {:.1f} depth-only draws/frame",
++                  double(skipped) / 600.0, double(kept) / 600.0);
 +      skipped = 0;
++      kept = 0;
 +    }
 +  }
 +};
@@ -11267,27 +11269,38 @@ index 001f36b..4ee7c3f 100644
 +  {
 +    // [4DevilTears] Depth pre-pass: learn the color passes, skip the depth-only draws.
 +    const RegisterFile& pregs = *register_file_;
-+    if (pregs.Get<reg::RB_MODECONTROL>().edram_mode == xenos::EdramMode::kColorDepth) {
++    xenos::EdramMode pmode = pregs.Get<reg::RB_MODECONTROL>().edram_mode;
++    if (pmode == xenos::EdramMode::kColorDepth || pmode == xenos::EdramMode::kDepthOnly) {
 +      uint32_t depth_control = pregs[XE_GPU_REG_RB_DEPTHCONTROL];
 +      bool z_enable = (depth_control >> 1) & 1, z_write = (depth_control >> 2) & 1;
 +      uint32_t zfunc = (depth_control >> 4) & 7;
 +      uint32_t color_mask = pregs[XE_GPU_REG_RB_COLOR_MASK];
 +      uint64_t pkey = PrepassKey(pregs);
-+      if (color_mask != 0 && z_enable) {
++      bool depth_only = pmode == xenos::EdramMode::kDepthOnly || color_mask == 0;
++      // A pixel shader may still cut holes (alpha test) or move the depth - keep those.
++      auto ps_harmless = [&]() {
++        auto* ps = static_cast<VulkanShader*>(active_pixel_shader());
++        if (!ps || pmode == xenos::EdramMode::kDepthOnly) return true;  // not run there
++        pipeline_cache_->AnalyzeShaderUcode(*ps);
++        return !ps->kills_pixels() && !ps->writes_depth();
++      };
++      if (!depth_only && z_enable) {
 +        g_prepass.color_keys_current.insert(pkey);
 +        // EQUAL (2), or a strict compare (LESS 1 / GREATER 4) without writing: relies on the
 +        // depth the pre-pass left.
 +        if (zfunc == 2 || ((zfunc == 1 || zfunc == 4) && !z_write)) {
 +          g_prepass.unsafe_current.insert(pkey);
 +        }
-+      } else if (REXCVAR_GET(skip_depth_prepass) && color_mask == 0 && z_enable && z_write &&
-+                 !active_pixel_shader() && !active_occlusion_query_.valid &&
++      } else if (REXCVAR_GET(skip_depth_prepass) && depth_only && z_enable && z_write &&
++                 ps_harmless() && !active_occlusion_query_.valid &&
 +                 g_prepass.color_keys_previous.count(pkey) &&
 +                 !g_prepass.unsafe_previous.count(pkey) &&
 +                 !g_prepass.unsafe_current.count(pkey) &&
 +                 ((depth_control & 1) == 0)) {  // no stencil (stencil marks must stay)
 +        ++g_prepass.skipped;
 +        return true;
++      } else if (depth_only && z_enable && z_write) {
++        ++g_prepass.kept;
 +      }
 +    }
 +  }
@@ -11299,7 +11312,7 @@ index 001f36b..4ee7c3f 100644
    const RegisterFile& regs = *register_file_;
    (void)index_buffer_info;
    auto draw_fail = [&](const char* stage) {
-@@ -3629,13 +5580,68 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
+@@ -3629,13 +5593,68 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
      return draw_fail("missing_vertex_shader");
    }
    pipeline_cache_->AnalyzeShaderUcode(*vertex_shader);
@@ -11372,7 +11385,7 @@ index 001f36b..4ee7c3f 100644
      }
      draw_util::AddMemExportRanges(regs, *vertex_shader, memexport_ranges_);
    }
-@@ -3681,6 +5687,365 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
+@@ -3681,6 +5700,365 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
    }
    reg::RB_DEPTHCONTROL normalized_depth_control = draw_util::GetNormalizedDepthControl(regs);
  
@@ -11738,7 +11751,7 @@ index 001f36b..4ee7c3f 100644
    uint32_t ps_param_gen_pos = UINT32_MAX;
    uint32_t interpolator_mask =
        pixel_shader ? (vertex_shader->writes_interpolators() &
-@@ -3835,6 +6200,7 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
+@@ -3835,6 +6213,7 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
    uint32_t used_texture_mask =
        vertex_shader->GetUsedTextureMaskAfterTranslation() |
        (pixel_shader != nullptr ? pixel_shader->GetUsedTextureMaskAfterTranslation() : 0);
@@ -11746,7 +11759,7 @@ index 001f36b..4ee7c3f 100644
    texture_cache_->RequestTextures(used_texture_mask);
  
    const VulkanPipelineCache::PipelineLayoutProvider* pipeline_layout_provider;
-@@ -4111,14 +6477,22 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
+@@ -4111,14 +6490,22 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
    // After all commands that may dispatch, copy or insert barriers, submit
    // the barriers (may end the render pass), and (re)enter the render pass
    // before drawing.
@@ -11769,7 +11782,7 @@ index 001f36b..4ee7c3f 100644
      deferred_command_buffer_.CmdVkDraw(primitive_processing_result.host_draw_vertex_count, 1, 0, 0);
    } else {
      std::pair<VkBuffer, VkDeviceSize> index_buffer;
-@@ -4150,10 +6524,33 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
+@@ -4150,10 +6537,33 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
          primitive_processing_result.host_index_format == xenos::IndexFormat::kInt16
              ? VK_INDEX_TYPE_UINT16
              : VK_INDEX_TYPE_UINT32);
@@ -11803,7 +11816,7 @@ index 001f36b..4ee7c3f 100644
    // Invalidate textures in memexported memory and watch for changes.
    if (!memexport_ranges_.empty()) {
      for (const draw_util::MemExportRange& memexport_range : memexport_ranges_) {
-@@ -4382,6 +6779,66 @@ bool VulkanCommandProcessor::IssueDraw_MemexportReadbackFastPath(uint32_t total_
+@@ -4382,6 +6792,66 @@ bool VulkanCommandProcessor::IssueDraw_MemexportReadbackFastPath(uint32_t total_
  }
  
  bool VulkanCommandProcessor::IssueCopy() {
@@ -11870,7 +11883,7 @@ index 001f36b..4ee7c3f 100644
  #if XE_GPU_FINE_GRAINED_DRAW_SCOPES
    SCOPE_profile_cpu_f("gpu");
  #endif  // XE_GPU_FINE_GRAINED_DRAW_SCOPES
-@@ -4393,8 +6850,22 @@ bool VulkanCommandProcessor::IssueCopy() {
+@@ -4393,8 +6863,22 @@ bool VulkanCommandProcessor::IssueCopy() {
    ReadbackResolveMode readback_mode = GetReadbackResolveMode(REXCVAR_GET(vulkan_readback_resolve));
    if (readback_mode == ReadbackResolveMode::kDisabled) {
      uint32_t written_address, written_length;
@@ -11895,7 +11908,7 @@ index 001f36b..4ee7c3f 100644
    }
  
    return IssueCopy_ReadbackResolvePath();
-@@ -5016,6 +7487,77 @@ void VulkanCommandProcessor::CheckSubmissionFenceAndDeviceLoss(uint64_t await_su
+@@ -5016,6 +7500,77 @@ void VulkanCommandProcessor::CheckSubmissionFenceAndDeviceLoss(uint64_t await_su
                                        submissions_in_flight_fences_awaited_end);
    submission_completed_ += fences_awaited;
  
@@ -11973,7 +11986,7 @@ index 001f36b..4ee7c3f 100644
    // Reclaim semaphores.
    while (!submissions_in_flight_semaphores_.empty()) {
      const auto& semaphore_submission = submissions_in_flight_semaphores_.front();
-@@ -5136,6 +7678,29 @@ bool VulkanCommandProcessor::BeginSubmission(bool is_guest_command) {
+@@ -5136,6 +7691,29 @@ bool VulkanCommandProcessor::BeginSubmission(bool is_guest_command) {
      // the end of the submission (when async pipeline object creation requests
      // are fulfilled).
      deferred_command_buffer_.Reset();
@@ -12003,7 +12016,7 @@ index 001f36b..4ee7c3f 100644
  
      // Reset cached state of the command buffer.
      dynamic_viewport_update_needed_ = true;
-@@ -5150,6 +7715,7 @@ bool VulkanCommandProcessor::BeginSubmission(bool is_guest_command) {
+@@ -5150,6 +7728,7 @@ bool VulkanCommandProcessor::BeginSubmission(bool is_guest_command) {
      dynamic_stencil_reference_back_update_needed_ = true;
      current_render_pass_ = VK_NULL_HANDLE;
      current_framebuffer_ = nullptr;
@@ -12011,7 +12024,7 @@ index 001f36b..4ee7c3f 100644
      in_render_pass_ = false;
      current_guest_graphics_pipeline_ = VK_NULL_HANDLE;
      current_external_graphics_pipeline_ = VK_NULL_HANDLE;
-@@ -5385,7 +7951,81 @@ bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
+@@ -5385,7 +7964,81 @@ bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
        REXGPU_ERROR("Failed to begin a Vulkan command buffer");
        return false;
      }
