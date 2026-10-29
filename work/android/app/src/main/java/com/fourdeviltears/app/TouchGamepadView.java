@@ -55,6 +55,10 @@ public class TouchGamepadView extends View implements InputManager.InputDeviceLi
     static native int nativeUiSprites(int[] out);
     static native boolean nativeSetListCursor(int value);
     static native void nativeUiCaptureFrame(String path);
+    static native boolean nativeRecStart(String path);
+    static native void nativeRecStop();
+    static native void nativeRecNote(String text);
+    static native int nativeHeavyFrames();
     static native boolean nativeSetTitleCursor(int value);
 
     // List menus (uListSelect subclasses) by vtable: touch rows in 1280x720 game space.
@@ -82,6 +86,8 @@ public class TouchGamepadView extends View implements InputManager.InputDeviceLi
     private long pauseSeenAt = 0;
     // A tap on a clean picture with no menu and no cutscene brings the controller back.
     private boolean tapReveal = false;
+    private boolean gameplaySticky = false;
+    private long lastHudAt = 0;
     private int sceneSeen = -1;
     private long sceneSince = 0;
 
@@ -104,6 +110,17 @@ public class TouchGamepadView extends View implements InputManager.InputDeviceLi
         else { sx = sy = Math.min(w / 1280f, h / 720f); }
         float ox = (w - 1280f * sx) / 2f, oy = (h - 720f * sy) / 2f;
         return new float[] { (x - ox) / sx, (y - oy) / sy };
+    }
+
+    /** Screen y of a game y (1280x720 game pixels), and the game-to-screen scale. */
+    private float[] gameYScale(float gy) {
+        float w = getWidth(), h = getHeight();
+        float sy;
+        if ("stretch".equals(DevilActivity.sScale) || "wide".equals(DevilActivity.sScale)) sy = h / 720f;
+        else if ("fill".equals(DevilActivity.sScale)) sy = Math.max(w / 1280f, h / 720f);
+        else sy = Math.min(w / 1280f, h / 720f);
+        float oy = (h - 720f * sy) / 2f;
+        return new float[] { oy + gy * sy, sy };
     }
 
     private static boolean sNativeOk = true;
@@ -461,7 +478,12 @@ public class TouchGamepadView extends View implements InputManager.InputDeviceLi
         Ctl start = new Ctl(K_BUTTON, BTN_START, "START", Color.WHITE);
         dpad = new Ctl(K_DPAD, 0, "", Color.WHITE);
         toggle = new Ctl(K_TOGGLE, 0, "◐", Color.WHITE);
-        ctls = new Ctl[] { a, b, x, y, lb, rb, lt, rt, back, start, dpad, toggle };
+        // Left stick back + Y in one button (a combination that is hard to press with thumbs).
+        Ctl yBack = new Ctl(K_BUTTON, BTN_COMBO_Y_BACK, "\u2193+Y", 0xFFF2C12E);
+        ctls = new Ctl[] { a, b, x, y, lb, rb, lt, rt, back, start, dpad, toggle, yBack };
+        rec = new Ctl(K_TOGGLE, 0, "REC", 0xFFE0453A);
+        uiShot = new Ctl(K_TOGGLE, 0, "UI", 0xFF4AA3E0);
+        gfxShot = new Ctl(K_TOGGLE, 0, "GFX", 0xFF6CC24A);
 
         setFocusable(false);
         handler.post(attachPoll);
@@ -474,7 +496,11 @@ public class TouchGamepadView extends View implements InputManager.InputDeviceLi
     private final Runnable fpsPoll = new Runnable() {
         @Override public void run() {
             if (sNativeOk) {
-                try { fps = nativeFps(); } catch (UnsatisfiedLinkError e) { fps = -1f; }
+                // The native value is the last frame only; shown smoothed (~1 s) so the counter
+                // reads the frame rate, not single frame-to-frame jitter.
+                float raw;
+                try { raw = nativeFps(); } catch (UnsatisfiedLinkError e) { raw = -1f; }
+                fps = raw <= 0 ? raw : (fps <= 0 ? raw : fps + (raw - fps) * 0.25f);
                 try { sceneMode = nativeSceneMode(); } catch (UnsatisfiedLinkError e) { sceneMode = 0; }
                 try { menuState = nativeMenuState(); } catch (UnsatisfiedLinkError e) { menuState = 0; }
                 try { listVt = nativeListMenu(); } catch (UnsatisfiedLinkError e) { listVt = 0; }
@@ -497,33 +523,73 @@ public class TouchGamepadView extends View implements InputManager.InputDeviceLi
                 // gameplay HUD is drawn, no cutscene / movie, no menu (any list menu, title).
                 // Any menu screen the game draws (rows / button prompts) - also the ones not
                 // known by their list object (options, settings pages...).
-                uiMenu = sceneMode == 0 && !hud && ui.refresh() && ui.hasMenu();
+                boolean sprites = sceneMode == 0 && ui.refresh();
+                // The HUD flag stays up in some in-mission menus (skills: a list object, button
+                // prompts) - a list the game keeps or a selectable list with known prompts wins.
+                uiMenu = sprites && ui.hasMenu()
+                        && (!hud || listVt != 0 || (ui.hasSelectableList() && ui.knownPrompts() > 0));
+                // Tutorial / help page (full-height panel; the HUD may stay drawn under it):
+                // the controller hides, a tap closes it (A), and the controller comes back at
+                // once when it is gone.
+                boolean tutoNow = sprites && menuState == 0 && listVt == 0 && ui.hasTutorialPanel();
+                if (tutoNow) tutoTextBottom = ui.tutorialTextBottom();
+                if (tutoNow) tutoSeenAt = now;
+                tutorialPopup = tutoNow;
                 if (sceneMode != sceneSeen) { sceneSeen = sceneMode; sceneSince = now; }
                 learnCursor();
+                recTick(now, hud);
                 // A screenshot job asks for the draws of this screen too (files/ui_capture_now).
                 if (++captureFlagTick % 10 == 0) {
                     java.io.File flag = new java.io.File(getContext().getFilesDir(), "ui_capture_now");
-                    if (flag.exists() && flag.delete()) { lastCapture = 0; captureScreen(); }
+                    if (flag.exists() && flag.delete()) {
+                        if (UiTouch.sLogFile == null) UiTouch.sLogFile = new java.io.File(getContext().getFilesDir(), "ui_taps.txt");
+                        ui.dump("shot scene " + sceneMode + " menu " + Integer.toHexString(menuState)
+                                + " list " + Integer.toHexString(listVt) + " hud " + hud + " uiMenu " + uiMenu
+                                + " overlay " + overlayVisible);
+                        lastCapture = 0;
+                        captureScreen();
+                    }
                 }
                 if (listVt == PAUSE_VT) { lastMenuWasPause = true; pauseSeenAt = now; }
                 else if (hud || sceneMode != 0 || menuState != 0 || listVt != 0
                         || (uiMenu && now - pauseSeenAt > 1000)) lastMenuWasPause = false;
                 if (hud || sceneMode != 0 || menuState != 0 || listVt != 0 || uiMenu) tapReveal = false;
-                boolean gameplay = hud && sceneMode == 0 && menuState == 0 && listVt == 0;
+                // A heavy 3D scene drawn for a while counts as gameplay too: the prologue and the
+                // tutorial play without the HUD (tutorial pop-ups there are not menus).
+                int heavy = 0;
+                try { heavy = nativeHeavyFrames(); } catch (UnsatisfiedLinkError e) { heavy = 0; }
+                boolean scene3d = heavy >= 30;
+                lastHeavy = heavy;
+                boolean gameplay = (hud || scene3d) && sceneMode == 0 && menuState == 0 && listVt == 0;
+                // Once playing, only a real menu (pause, lists, title), a cutscene / movie or a
+                // long time without the HUD ends gameplay: tutorial pop-ups hide the HUD and
+                // show button prompts, but the player still needs the controller.
+                if (gameplay) { gameplaySticky = true; lastHudAt = now; }
+                else if (menuState != 0 || listVt != 0 || sceneMode != 0 || now - lastHudAt > 60000) {
+                    gameplaySticky = false;
+                }
+                if (gameplaySticky && sceneMode == 0) gameplay = true;
                 if (!gameplay && bootDone && sceneMode == 0 && menuState == 0 && listVt == 0 && !uiMenu
                         && (lastMenuWasPause || tapReveal)) gameplay = true;
                 // Safety net: no menu / cutscene for a while but no HUD either (a gameplay part
                 // without the HUD?) - give the controller back rather than leave the player stuck.
                 if (!hud && !uiMenu && bootDone && sceneMode == 0 && menuState == 0 && listVt == 0) {
                     if (noHudSince == 0) noHudSince = now;
-                    if (now - noHudSince > 6000) gameplay = true;
+                    // Only over a 3D scene: a 2D screen waiting for START (secret mission intro,
+                    // heavy 0) is not gameplay - it keeps the clean picture.
+                    if (now - noHudSince > 6000 && heavy > 0) gameplay = true;
                 } else noHudSince = 0;
+                // A list to pick from (game over, mission result...) over a 3D scene, right
+                // after the HUD: the HUD rules would keep the controller - the list wins.
+                if (uiMenu && ui.hasSelectableList()) { gameplay = false; gameplaySticky = false; }
+                if (tutorialPopup) gameplay = false;  // sticky kept: gameplay resumes after it
                 boolean want = DevilActivity.sCinemaMode && !touching && !gameplay;
                 boolean ch;
                 if (want) { ch = true; clearSince = 0; }
                 else if (cinemaHidden && !touching) {
                     if (clearSince == 0) clearSince = now;
-                    ch = now - clearSince < SHOW_DELAY_MS;
+                    // Back from a tutorial page: no delay, the fight goes on.
+                    ch = now - clearSince < SHOW_DELAY_MS && now - tutoSeenAt > 1500;
                 } else ch = false;
                 if (ch != cinemaHidden) {
                     cinemaHidden = ch;
@@ -624,6 +690,14 @@ public class TouchGamepadView extends View implements InputManager.InputDeviceLi
         ctls[8].rect = new RectF(w / 2f - 60 * s - sw, top, w / 2f - 60 * s, top + sh);   // BACK
         ctls[9].rect = new RectF(w / 2f + 60 * s, top, w / 2f + 60 * s + sw, top + sh);   // START
         place(toggle, w / 2f, top + sh / 2f, 18 * s);
+        // Back+Y: next to the face buttons, up and left of Y (reachable with the right thumb).
+        place(ctls[12], fcx - 1.6f * faceOff, fcy - 1.5f * faceOff, face * 0.9f);
+        // Debug recorder button: small, under LT, always drawn (also over cutscenes).
+        place(rec, side + 22 * s, top + bh + 40 * s, 16 * s);
+        // Under it: UI capture (screenshot + every sprite of the frame) and GFX capture
+        // (screenshot + one-frame GPU trace of the frame as it is).
+        place(uiShot, side + 22 * s, top + bh + 84 * s, 16 * s);
+        place(gfxShot, side + 22 * s, top + bh + 128 * s, 16 * s);
 
         place(dpad, 275 * s, h - 80 * s, 62 * s);
 
@@ -654,14 +728,36 @@ public class TouchGamepadView extends View implements InputManager.InputDeviceLi
             case MotionEvent.ACTION_POINTER_DOWN: {
                 float x = e.getX(idx), y = e.getY(idx);
                 lastTouch = System.currentTimeMillis();
+                if (DevilActivity.sDebugRec && rec != null && rec.hit(x, y, 10 * dp)) {
+                    toggleRecording();
+                    return true;
+                }
+                if (DevilActivity.sDebugRec && uiShot != null && uiShot.hit(x, y, 8 * dp)) {
+                    captureUi();
+                    return true;
+                }
+                if (DevilActivity.sDebugRec && gfxShot != null && gfxShot.hit(x, y, 8 * dp)) {
+                    captureGfx();
+                    return true;
+                }
+                if (physicalPadConnected()) {
+                    // A physical controller hides the overlay; menus still answer to touch.
+                    boolean titleScreen = (menuState & 0x10000) != 0;
+                    if (titleScreen || (sceneMode == 0 && (menuState != 0 || uiMenu))) {
+                        menuTouchDown(e.getPointerId(idx), x, y, action);
+                        return true;
+                    }
+                }
                 if (cinemaHidden && !userHidden && !physicalPadConnected()) {
-                    if (sceneMode == 0 && (menuState != 0 || uiMenu)) menuTouchDown(e.getPointerId(idx), x, y, action);
+                    // The title screens count as menus even over their background movie.
+                    boolean titleScreen = (menuState & 0x10000) != 0;
+                    if (titleScreen || (sceneMode == 0 && (menuState != 0 || uiMenu))) menuTouchDown(e.getPointerId(idx), x, y, action);
                     else cinemaTouch(e.getPointerId(idx), x, y);
                     return true;
                 }
                 updateAlpha(true);
                 if (!overlayVisible) {
-                    if (toggle.hit(x, y, 12 * dp)) { userHidden = false; updateVisibility(); return true; }
+                    if (SHOW_TOGGLE_BUTTON && toggle.hit(x, y, 12 * dp)) { userHidden = false; updateVisibility(); return true; }
                     return false;  // let the game see it
                 }
                 down(e.getPointerId(idx), x, y);
@@ -783,6 +879,156 @@ public class TouchGamepadView extends View implements InputManager.InputDeviceLi
     }
 
     private static final int PAUSE_VT = 0x820AA1F8;
+    static final int BTN_COMBO_Y_BACK = 100;
+    private static final boolean DIRECT_CURSOR = false;
+
+    // ---- debug recorder: REC button / runner flag file -----------------------------------
+    private Ctl rec;
+    private boolean recording = false;
+    private int lastHeavy = 0;
+    private boolean tutorialPopup = false;
+    private int tutoTextBottom = 0;
+    private long tutoSeenAt = 0;
+    private long recSince = 0, recNoteAt = 0;
+    private int recFlagTick = 0;
+
+    private void toggleRecording() {
+        haptic();
+        if (!recording) {
+            String name = "rec_" + new java.text.SimpleDateFormat("HHmmss", java.util.Locale.US)
+                    .format(new java.util.Date()) + ".txt";
+            String path = new java.io.File(getContext().getFilesDir(), name).getPath();
+            boolean ok = false;
+            try { ok = nativeRecStart(path); } catch (UnsatisfiedLinkError e) { }
+            recording = ok;
+            recSince = System.currentTimeMillis();
+        } else {
+            try { nativeRecStop(); } catch (UnsatisfiedLinkError e) { }
+            recording = false;
+        }
+        invalidate();
+    }
+
+    /** While recording: the app's view of the game twice a second; runner flag file. */
+    private void recTick(long now, boolean hud) {
+        if (++recFlagTick % 10 == 0) {
+            java.io.File flag = new java.io.File(getContext().getFilesDir(), "rec_toggle");
+            if (flag.exists() && flag.delete()) toggleRecording();
+        }
+        if (!recording || now - recNoteAt < 500) return;
+        recNoteAt = now;
+        try {
+            nativeRecNote("APP fps " + fps + " scene " + sceneMode + " menu " + Integer.toHexString(menuState)
+                    + " list " + Integer.toHexString(listVt) + " hud " + hud + " uiMenu " + uiMenu
+                    + " hidden " + cinemaHidden + " heavy " + lastHeavy);
+        } catch (UnsatisfiedLinkError e) { }
+    }
+
+    // ---- debug captures: UI (sprites) and GFX (GPU frame trace), with a screenshot each ----
+    private Ctl uiShot, gfxShot;
+    private long uiShotAt = 0, gfxShotAt = 0;
+
+    private static String stamp() {
+        return new java.text.SimpleDateFormat("HHmmss", java.util.Locale.US).format(new java.util.Date());
+    }
+
+    /** The game picture as it is now, into files/<name> (PixelCopy of SDL's surface). */
+    private void saveScreenshot(String name) {
+        android.view.SurfaceView sv = DevilActivity.gameSurface();
+        if (sv == null || sv.getWidth() <= 0 || android.os.Build.VERSION.SDK_INT < 24) return;
+        final android.graphics.Bitmap bmp = android.graphics.Bitmap.createBitmap(
+                sv.getWidth(), sv.getHeight(), android.graphics.Bitmap.Config.ARGB_8888);
+        final java.io.File out = new java.io.File(getContext().getFilesDir(), name);
+        try {
+            android.view.PixelCopy.request(sv, bmp, result -> {
+                if (result != android.view.PixelCopy.SUCCESS) return;
+                new Thread(() -> {
+                    try (java.io.FileOutputStream f = new java.io.FileOutputStream(out)) {
+                        bmp.compress(android.graphics.Bitmap.CompressFormat.PNG, 100, f);
+                    } catch (Exception ignored) { }
+                }).start();
+            }, handler);
+        } catch (Exception ignored) { }
+    }
+
+    private void captureUi() {
+        haptic();
+        String t = stamp();
+        uiShotAt = System.currentTimeMillis();
+        if (UiTouch.sLogFile == null) UiTouch.sLogFile = new java.io.File(getContext().getFilesDir(), "ui_taps.txt");
+        ui.dump("button " + t + " scene " + sceneMode + " menu " + Integer.toHexString(menuState)
+                + " list " + Integer.toHexString(listVt) + " uiMenu " + uiMenu + " tuto " + tutorialPopup
+                + " hidden " + cinemaHidden + " heavy " + lastHeavy);
+        saveScreenshot("ui_" + t + ".png");
+        invalidate();
+    }
+
+    private void captureGfx() {
+        haptic();
+        final String t = stamp();
+        gfxShotAt = System.currentTimeMillis();
+        // Three pictures over the recorded burst (12 frames, ~0.2 s): which frames glitched.
+        saveScreenshot("gfx_" + t + "_0.png");
+        handler.postDelayed(() -> saveScreenshot("gfx_" + t + "_1.png"), 120);
+        handler.postDelayed(() -> saveScreenshot("gfx_" + t + "_2.png"), 240);
+        final java.io.File dir = getContext().getFilesDir();
+        final java.io.File trace = new java.io.File(dir, "frame_trace.txt");
+        trace.delete();
+        try { new java.io.File(dir, "trace_now_light").createNewFile(); } catch (Exception ignored) { }
+        try { nativeRecNote("GFX capture " + t); } catch (UnsatisfiedLinkError ignored) { }
+        // The trace is written over the next frame or two: keep it under its own name.
+        handler.postDelayed(new Runnable() {
+            int tries = 0;
+            @Override public void run() {
+                if (trace.length() > 0 && traceDone(trace)) {
+                    trace.renameTo(new java.io.File(dir, "gfx_" + t + ".txt"));
+                } else if (++tries < 20) handler.postDelayed(this, 500);
+            }
+        }, 1000);
+        invalidate();
+    }
+
+    private static boolean traceDone(java.io.File f) {
+        try (java.io.RandomAccessFile r = new java.io.RandomAccessFile(f, "r")) {
+            long n = r.length();
+            r.seek(Math.max(0, n - 200));
+            byte[] b = new byte[(int) Math.min(200, n)];
+            r.readFully(b);
+            return new String(b, "UTF-8").contains("END");
+        } catch (Exception e) { return false; }
+    }
+
+    private void drawShotButton(Canvas cv, Ctl c, long at) {
+        boolean flash = System.currentTimeMillis() - at < 600;
+        fill.setColor(flash ? (c.color & 0x00FFFFFF) | 0xD0000000 : 0x30000000);
+        cv.drawCircle(c.cx, c.cy, c.r, fill);
+        stroke.setColor(flash ? c.color : 0x88FFFFFF);
+        cv.drawCircle(c.cx, c.cy, c.r, stroke);
+        text.setColor(0xDDFFFFFF);
+        float ts = text.getTextSize();
+        text.setTextSize(ts * 0.6f);
+        cv.drawText(c.label, c.cx, c.cy - (text.descent() + text.ascent()) / 2f, text);
+        text.setTextSize(ts);
+        if (flash) postInvalidateDelayed(100);
+    }
+
+    private void drawRec(Canvas cv) {
+        if (!DevilActivity.sDebugRec || rec == null) return;
+        if (uiShot != null) drawShotButton(cv, uiShot, uiShotAt);
+        if (gfxShot != null) drawShotButton(cv, gfxShot, gfxShotAt);
+        long now = System.currentTimeMillis();
+        boolean blink = recording && ((now - recSince) / 500) % 2 == 0;
+        fill.setColor(recording ? (blink ? 0xD0E0453A : 0x70E0453A) : 0x30000000);
+        cv.drawCircle(rec.cx, rec.cy, rec.r, fill);
+        stroke.setColor(recording ? 0xFFE0453A : 0x88FFFFFF);
+        cv.drawCircle(rec.cx, rec.cy, rec.r, stroke);
+        text.setColor(0xDDFFFFFF);
+        float ts = text.getTextSize();
+        text.setTextSize(ts * 0.6f);
+        cv.drawText(recording ? "STOP" : "REC", rec.cx, rec.cy - (text.descent() + text.ascent()) / 2f, text);
+        text.setTextSize(ts);
+        if (recording) postInvalidateDelayed(250);
+    }
     private long lastCapture = 0;
     private int captureFlagTick = 0;
 
@@ -829,7 +1075,8 @@ public class TouchGamepadView extends View implements InputManager.InputDeviceLi
     private boolean setCursorDirect(UiTouch.Action act) {
         int cur = gameCursor();
         boolean ok = false;
-        if (cursorTrusted() && cur == act.from) {
+        // Off for now: writing the cursor of the pause menu preceded a hang (28 Oct, 21:11).
+        if (DIRECT_CURSOR && cursorTrusted() && cur == act.from) {
             try {
                 ok = listVt != 0 ? nativeSetListCursor(act.target) : nativeSetTitleCursor(act.target);
             } catch (UnsatisfiedLinkError e) { ok = false; }
@@ -855,12 +1102,24 @@ public class TouchGamepadView extends View implements InputManager.InputDeviceLi
         // they are where a player's thumbs already are).
         Ctl start = ctls[9], a = ctls[0];
         Ctl hot = start.hit(x, y, 8 * dp) ? start : (a.hit(x, y, 8 * dp) ? a : null);
-        if (hot != null) {
+        if (tutorialPopup) {
+            // Tutorial page: a tap anywhere closes it.
+            haptic();
+            button(BTN_A, true);
+            handler.postDelayed(() -> button(BTN_A, false), 110);
+        } else if (hot != null) {
             owners.put(pid, hot);
             press(hot, true);
             hintUntil = 0;
         } else if (!bootDone && (sceneMode == 0 || now - sceneSince < 6000)) {
             // The first logos (Capcom, Dolby) cannot be skipped: no "tap again" hint.
+        } else if (sceneMode == 0 && lastHeavy == 0 && !lastMenuWasPause) {
+            // A 2D screen with no menu and no 3D scene (secret mission intro "Start mission"):
+            // it waits for START - a tap presses START and A, like the title's press-start.
+            haptic();
+            button(BTN_START, true);
+            button(BTN_A, true);
+            handler.postDelayed(() -> { button(BTN_START, false); button(BTN_A, false); }, 110);
         } else if (sceneMode == 0) {
             // Not a cutscene / movie (e.g. back from the pause menu before the HUD shows):
             // never START (it would pause again) - give the controller back instead.
@@ -876,6 +1135,35 @@ public class TouchGamepadView extends View implements InputManager.InputDeviceLi
         }
         invalidate();
     }
+
+    /** Under a tutorial page: how to close it (same band as the skip hint, one stage). */
+    private void drawTutorialHint(Canvas canvas) {
+        if (!tutorialPopup) { tutoHintSince = 0; return; }
+        long now = System.currentTimeMillis();
+        if (tutoHintSince == 0) tutoHintSince = now;
+        float a = Math.min(1f, (now - tutoHintSince) / 250f);
+        // Placed in the game picture's own coordinates (any screen size / scaling mode): the
+        // baseline at game y 598 - under the lowest text of the page (~y 520), above the
+        // page's green "tip" line (~y 631).
+        int w = getWidth(), h = getHeight();
+        // A page whose text runs low (help pages with long text): the hint goes to the
+        // panel's bottom edge instead, under the text.
+        boolean low = tutoTextBottom > 600;
+        float[] base = gameYScale(low ? 704f : 598f), top = gameYScale(low ? 640f : 500f);
+        float sy = base[1];
+        hintBand.setShader(new LinearGradient(0, top[0], 0, h, 0x00000000,
+                ((int) (0xB0 * a) << 24), Shader.TileMode.CLAMP));
+        canvas.drawRect(0, top[0], w, h, hintBand);
+        hintPaint.setTextAlign(Paint.Align.CENTER);
+        hintPaint.setColor(((int) (0xF0 * a) << 24) | 0xFFFFFF);
+        hintPaint.setTextSize(28f * sy);
+        hintPaint.setFakeBoldText(true);
+        hintPaint.setLetterSpacing(0.08f);
+        canvas.drawText(DevilActivity.sRussianEdition ? "КОСНИТЕСЬ, ЧТОБЫ ЗАКРЫТЬ" : "TAP TO CLOSE",
+                w / 2f, base[0], hintPaint);
+        if (a < 1f) postInvalidateOnAnimation();
+    }
+    private long tutoHintSince = 0;
 
     private void drawSkipHint(Canvas canvas) {
         long now = System.currentTimeMillis();
@@ -893,7 +1181,8 @@ public class TouchGamepadView extends View implements InputManager.InputDeviceLi
         hintPaint.setFakeBoldText(true);
         hintPaint.setLetterSpacing(0.08f);
         String what = sceneMode == 2 ? "MOVIE" : "CUTSCENE";
-        canvas.drawText("TAP AGAIN TO SKIP " + what, w / 2f, h - 40 * dp, hintPaint);
+        canvas.drawText(DevilActivity.sRussianEdition ? "КОСНИТЕСЬ ЕЩЁ РАЗ ДЛЯ ПРОПУСКА"
+                : "TAP AGAIN TO SKIP " + what, w / 2f, h - 40 * dp, hintPaint);
         // Thin progress line: how long the second tap is accepted.
         float frac = Math.max(0f, left / (HINT_MS / 1000f));
         hintPaint.setStrokeWidth(2 * dp);
@@ -905,7 +1194,12 @@ public class TouchGamepadView extends View implements InputManager.InputDeviceLi
 
     // ---- opacity / idle fade ------------------------------------------------------------------
 
+    /** The round show / hide button of the overlay: off - the settings switch (system Back
+     *  opens the settings) shows and hides the controller, one control less on the screen. */
+    static final boolean SHOW_TOGGLE_BUTTON = false;
+
     private boolean isOptional(Ctl c) {
+        if (c == toggle && !SHOW_TOGGLE_BUTTON) return true;
         // "Essential buttons only": BACK, LB and the D-pad are hidden.
         return DevilActivity.sEssentialOnly && (c == ctls[8] || c == ctls[4] || c == dpad);
     }
@@ -948,6 +1242,14 @@ public class TouchGamepadView extends View implements InputManager.InputDeviceLi
             return;
         }
         Stick st = x < getWidth() / 2f ? lstick : rstick;
+        if (st == rstick) {
+            // Camera side: a finger that just missed a button (a ring around each) does not
+            // swing the camera - it does nothing.
+            for (Ctl c : ctls) {
+                if (c.kind == K_TOGGLE || isOptional(c)) continue;
+                if (c.hit(x, y, 26 * dp)) return;
+            }
+        }
         if (st.pointer != -1) return;
         st.pointer = pid;
         owners.put(pid, st);
@@ -1014,6 +1316,20 @@ public class TouchGamepadView extends View implements InputManager.InputDeviceLi
     private void press(Ctl c, boolean down) {
         if (c.pressed == down) return;
         c.pressed = down;
+        if (c.id == BTN_COMBO_Y_BACK && c.kind == K_BUTTON) {
+            // Left stick back (down) + Y: the direction first, Y a frame later so the game
+            // sees the stick already held when Y goes down.
+            if (down) {
+                axis(AX_LX, 0f);
+                axis(AX_LY, 1f);
+                handler.postDelayed(() -> { if (c.pressed) button(BTN_Y, true); }, 40);
+                haptic();
+            } else {
+                button(BTN_Y, false);
+                if (lstick.pointer == -1) axis(AX_LY, 0f);
+            }
+            return;
+        }
         if (c.kind == K_TRIGGER) axis(c.id, down ? 1f : 0f);
         else button(c.id, down);
         if (down) haptic();
@@ -1066,17 +1382,24 @@ public class TouchGamepadView extends View implements InputManager.InputDeviceLi
             canvas.drawColor(Color.BLACK);
             return;
         }
+        drawRec(canvas);
         if (cinemaHidden) {  // clean picture: no controls, no toggle, no FPS
             drawSkipHint(canvas);
+            drawTutorialHint(canvas);
             return;
         }
         drawFps(canvas);
         if (!overlayVisible) {
-            drawCircle(canvas, toggle, 0x55FFFFFF, false);
+            if (SHOW_TOGGLE_BUTTON) drawCircle(canvas, toggle, 0x55FFFFFF, false);
             return;
         }
-        drawStick(canvas, lstick);
-        drawStick(canvas, rstick);
+        // Essential layout: both sticks show only while a finger holds them (floating -
+        // they centre under the finger anyway); the screen stays clean otherwise.
+        if (!DevilActivity.sEssentialOnly || lstick.pointer != -1) drawStick(canvas, lstick);
+        // Essential layout: the right stick is invisible - the free right side of the screen
+        // turns the camera (touch, drag: the stick centres under the finger; double-tap
+        // centres the camera, R3). It is drawn only while a finger holds it.
+        if (!DevilActivity.sEssentialOnly || rstick.pointer != -1) drawStick(canvas, rstick);
         for (Ctl c : ctls) {
             if (isOptional(c)) continue;
             if (c == dpad) drawDpad(canvas);

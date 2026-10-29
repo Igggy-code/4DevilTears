@@ -42,21 +42,30 @@ public class DevilActivity extends SDLActivity {
     /** Controller look (settings): opacity 0.2..1, fade when idle, essential buttons only. */
     static volatile float sPadOpacity = 0.58f;
     static volatile boolean sFadeIdle = true;
-    static volatile boolean sEssentialOnly = false;
+    static volatile boolean sEssentialOnly = true;
+    /** Developer mode: the REC / UI / GFX capture buttons on the overlay. Off for players;
+     *  tapping the "Settings" title 8 times turns it on, 3 more taps turn it off. */
+    static volatile boolean sDebugRec = false;
+    static final String KEY_DEV_MODE = "developer_mode";
+    private int devTaps = 0;
+    private long devTapAt = 0;
     /** Skip the intro movie at launch (on by default when the edition's intro carries
      *  third-party captions, e.g. the Russian fan translation). */
     static volatile boolean sSkipIntro = false;
+    /** The Russian fan translation (recognised by its re-encoded, captioned intro movie):
+     *  the app's own on-screen hints are written in Russian. */
+    static volatile boolean sRussianEdition = false;
     /** fit | fill | stretch - TouchGamepadView maps touches to game coordinates with it. */
     static volatile String sScale = "wide";
 
-    // ---- settings (Back button / back gesture, or long press on the overlay toggle) ----
+    // ---- settings (Back button / back gesture) ----
     static final String PREFS = "settings";
     static final String KEY_SCALE = "scale";            // wide | fit | fill | stretch
     static final String DEFAULT_SCALE = "wide";
     static final String KEY_SHOW_FPS = "show_fps";
     static final String KEY_SHOW_PAD = "show_pad";
     static final String KEY_CINEMA = "cinema_mode";
-    static final String KEY_FPS_CAP = "fps_cap";        // 0 = unlocked, 30
+    static final String KEY_FPS_CAP = "fps_cap";        // 0 = unlocked, 30, 40
     static final String KEY_OPACITY = "pad_opacity";     // percent
     static final String KEY_FADE_IDLE = "pad_fade_idle";
     static final String KEY_ESSENTIAL = "pad_essential";
@@ -182,6 +191,30 @@ public class DevilActivity extends SDLActivity {
         return t;
     }
 
+    /** The display has a mode at (a multiple of) this refresh rate. */
+    private boolean displaySupportsRefresh(float hz) {
+        try {
+            android.view.Display d = getWindowManager().getDefaultDisplay();
+            for (android.view.Display.Mode m : d.getSupportedModes()) {
+                float r = m.getRefreshRate();
+                if (r >= hz - 0.5f && Math.abs(r / hz - Math.round(r / hz)) < 0.01f) return true;
+            }
+        } catch (Exception e) { Log.w(TAG, "display modes", e); }
+        return false;
+    }
+
+    /** Tell Android the game's frame rate, so it runs the screen in a mode that shows every
+     *  frame for the same time (40 -> 120 Hz). 0 = no cap: the default (highest) mode. */
+    void applyFrameRateHint(int cap) {
+        if (android.os.Build.VERSION.SDK_INT < 30) return;
+        try {
+            android.view.SurfaceView sv = gameSurface();
+            if (sv == null || !sv.getHolder().getSurface().isValid()) return;
+            sv.getHolder().getSurface().setFrameRate(cap > 0 ? cap : 0f,
+                    android.view.Surface.FRAME_RATE_COMPATIBILITY_FIXED_SOURCE);
+        } catch (Exception e) { Log.w(TAG, "setFrameRate", e); }
+    }
+
     private android.widget.Switch switchRow(String text, boolean checked,
             android.widget.CompoundButton.OnCheckedChangeListener listener) {
         android.widget.Switch sw = new android.widget.Switch(this);
@@ -219,7 +252,21 @@ public class DevilActivity extends SDLActivity {
         settingsPanel.setBackground(bg);
         settingsPanel.setClickable(true);  // don't close when tapping the panel itself
 
-        settingsPanel.addView(label("Settings", 22, 0xFFFFFFFF, true));
+        android.widget.TextView settingsTitle = label("Settings", 22, 0xFFFFFFFF, true);
+        settingsTitle.setOnClickListener(v -> {
+            long now = System.currentTimeMillis();
+            devTaps = now - devTapAt < 1500 ? devTaps + 1 : 1;  // taps in a row
+            devTapAt = now;
+            int needed = sDebugRec ? 3 : 8;
+            if (devTaps < needed) return;
+            devTaps = 0;
+            sDebugRec = !sDebugRec;
+            p.edit().putBoolean(KEY_DEV_MODE, sDebugRec).apply();
+            Toast.makeText(this, sDebugRec ? "Developer mode on: REC / UI / GFX buttons"
+                    : "Developer mode off", Toast.LENGTH_SHORT).show();
+            if (gamepadView != null) gamepadView.invalidate();
+        });
+        settingsPanel.addView(settingsTitle);
         android.widget.TextView sub = label("4DevilTears", 12, 0xFF9AA0AA, false);
         sub.setPadding(0, 0, 0, dpx(14));
         settingsPanel.addView(sub);
@@ -254,12 +301,29 @@ public class DevilActivity extends SDLActivity {
                     Toast.LENGTH_SHORT).show();
         });
         settingsPanel.addView(scaleGroup);
-        settingsPanel.addView(switchRow("Lock to 30 FPS (steadier, cooler)",
-                p.getInt(KEY_FPS_CAP, 0) == 30, (b, on) -> {
-                    p.edit().putInt(KEY_FPS_CAP, on ? 30 : 0).apply();
-                    try { nativeSetFlag("frame_rate_limit", on ? "30" : "0"); }
-                    catch (UnsatisfiedLinkError e) { Log.w(TAG, "nativeSetFlag", e); }
-                }));
+        // Frame rate caps: 30 or 40 (40 divides a 120 Hz display evenly - smoother than 30,
+        // lighter than unlocked). One excludes the other.
+        // 40 is offered only where it divides the screen's refresh evenly (120 Hz modes).
+        final boolean has120 = displaySupportsRefresh(120f);
+        final android.widget.Switch[] caps = new android.widget.Switch[2];
+        final int[] capValues = { 30, 40 };
+        final String[] capTexts = { "Lock to 30 FPS (steadier, cooler)",
+                "Lock to 40 FPS (smoother than 30, cooler than unlocked)" };
+        for (int i = 0; i < (has120 ? 2 : 1); i++) {
+            final int idx = i;
+            caps[i] = switchRow(capTexts[i], p.getInt(KEY_FPS_CAP, 0) == capValues[i], (b, on) -> {
+                if (on && caps[1 - idx] != null && caps[1 - idx].isChecked()) {
+                    caps[1 - idx].setChecked(false);  // its listener writes 0 - written over below
+                }
+                int cap = on ? capValues[idx] : (caps[1 - idx] != null && caps[1 - idx].isChecked()
+                        ? capValues[1 - idx] : 0);
+                p.edit().putInt(KEY_FPS_CAP, cap).apply();
+                try { nativeSetFlag("frame_rate_limit", String.valueOf(cap)); }
+                catch (UnsatisfiedLinkError e) { Log.w(TAG, "nativeSetFlag", e); }
+                applyFrameRateHint(cap);
+            });
+            settingsPanel.addView(caps[i]);
+        }
 
         android.widget.TextView overlayTitle = label("Overlay", 13, 0xFFE0453A, true);
         overlayTitle.setPadding(0, dpx(14), 0, dpx(0));
@@ -284,7 +348,7 @@ public class DevilActivity extends SDLActivity {
         settingsPanel.addView(label("Cutscenes and movies play without any controls on screen: tap once, then tap again "
                 + "to skip. On the title screen: tap to confirm, swipe to move, two fingers to go back.", 12, 0xFFB8BEC8, false));
 
-        settingsPanel.addView(switchRow("Skip intro movie", p.getBoolean(KEY_SKIP_INTRO, editedIntro()),
+        settingsPanel.addView(switchRow("Skip intro movie", p.getBoolean(KEY_SKIP_INTRO, false),
                 (b, on) -> {
                     p.edit().putBoolean(KEY_SKIP_INTRO, on).apply();
                     sSkipIntro = on;
@@ -296,7 +360,7 @@ public class DevilActivity extends SDLActivity {
                     if (gamepadView != null) gamepadView.refreshFromSettings();
                 }));
         settingsPanel.addView(switchRow("Essential buttons only (no BACK, LB, D-pad)",
-                p.getBoolean(KEY_ESSENTIAL, false), (b, on) -> {
+                p.getBoolean(KEY_ESSENTIAL, true), (b, on) -> {
                     p.edit().putBoolean(KEY_ESSENTIAL, on).apply();
                     sEssentialOnly = on;
                     if (gamepadView != null) gamepadView.refreshFromSettings();
@@ -445,6 +509,7 @@ public class DevilActivity extends SDLActivity {
             mSurface.getHolder().addCallback(new android.view.SurfaceHolder.Callback() {
                 @Override public void surfaceCreated(android.view.SurfaceHolder holder) {
                     try { nativeSurfaceState(true); } catch (Throwable t) { }
+                    applyFrameRateHint(prefs().getInt(KEY_FPS_CAP, 0));
                 }
                 @Override public void surfaceChanged(android.view.SurfaceHolder holder, int format,
                                                      int width, int height) { }
@@ -464,16 +529,22 @@ public class DevilActivity extends SDLActivity {
         // On-screen Xbox 360 controller over the game surface (hides itself while a
         // physical controller is connected).
         sShowFps = prefs().getBoolean(KEY_SHOW_FPS, true);
+        sDebugRec = prefs().getBoolean(KEY_DEV_MODE, false);
         // Cinema mode becomes the main mode: switched on once for everyone (also where it had
         // been turned off before); the switch in the settings still works afterwards.
+        // The intro movie plays (tap twice to skip) - also the Russian edition's shorter one.
+        if (!prefs().getBoolean("intro_default_v1", false)) {
+            prefs().edit().putBoolean(KEY_SKIP_INTRO, false).putBoolean("intro_default_v1", true).apply();
+        }
         if (!prefs().getBoolean("cinema_default_v2", false)) {
             prefs().edit().putBoolean(KEY_CINEMA, true).putBoolean("cinema_default_v2", true).apply();
         }
         sCinemaMode = prefs().getBoolean(KEY_CINEMA, true);
         sPadOpacity = prefs().getInt(KEY_OPACITY, 58) / 100f;
         sFadeIdle = prefs().getBoolean(KEY_FADE_IDLE, true);
-        sEssentialOnly = prefs().getBoolean(KEY_ESSENTIAL, false);
-        sSkipIntro = prefs().getBoolean(KEY_SKIP_INTRO, editedIntro());
+        sEssentialOnly = prefs().getBoolean(KEY_ESSENTIAL, true);
+        sSkipIntro = prefs().getBoolean(KEY_SKIP_INTRO, false);
+        try { sRussianEdition = editedIntro(); } catch (Exception e) { sRussianEdition = false; }
         sScale = prefs().getString(KEY_SCALE, DEFAULT_SCALE);
         if (mLayout != null) {
             gamepadView = new TouchGamepadView(this);
@@ -573,7 +644,7 @@ public class DevilActivity extends SDLActivity {
             args.add("--present_safe_area_y=" + fillSafeArea());
         }
         // The intro movie is skipped by the app: draw nothing of it meanwhile.
-        if (prefs().getBoolean(KEY_SKIP_INTRO, editedIntro())) args.add("--dmc4_hide_first_movie=true");
+        if (prefs().getBoolean(KEY_SKIP_INTRO, false)) args.add("--dmc4_hide_first_movie=true");
         if (prefs().getInt(KEY_FPS_CAP, 0) > 0) args.add("--frame_rate_limit=" + prefs().getInt(KEY_FPS_CAP, 0));
         // Extra flags for experiments without rebuilding: files/args.txt
         File extra = new File(getFilesDir(), "args.txt");
