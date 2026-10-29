@@ -396,7 +396,17 @@ static void* Dmc4GpuSym(const char* name) {
   void* sym = lib ? dlsym(lib, name) : nullptr;
   return sym ? sym : dlsym(RTLD_DEFAULT, name);
 }
+// [4DevilTears] The renderer collapses EDRAM bands in gameplay only: tell it when the HUD is up.
+static int Dmc4HudActiveC() { return NowMs() - g_cock_draw_ms.load() < 300 ? 1 : 0; }
 static void Dmc4RegisterUiSignature() {
+  static std::atomic<bool> hud_done{false};
+  if (!hud_done.load()) {
+    using SetHudFn = void (*)(int (*)());
+    if (auto set_hud = reinterpret_cast<SetHudFn>(Dmc4GpuSym("Rex4dtSetHudActiveFn"))) {
+      set_hud(&Dmc4HudActiveC);
+      hud_done.store(true);
+    }
+  }
   static std::atomic<bool> done{false};
   if (done.load()) return;
   using SetFn = void (*)(uint64_t (*)());
@@ -412,6 +422,54 @@ extern "C" JNIEXPORT jboolean JNICALL
 Java_com_fourdeviltears_app_TouchGamepadView_nativeHudActive(JNIEnv*, jclass) {
   Dmc4RegisterUiSignature();
   return NowMs() - g_cock_draw_ms.load() < 300 ? 1 : 0;
+}
+
+// Consecutive frames with a heavy 3D scene (renderer): gameplay even when the game draws no
+// HUD (prologue, tutorial).
+extern "C" JNIEXPORT jint JNICALL
+Java_com_fourdeviltears_app_TouchGamepadView_nativeHeavyFrames(JNIEnv*, jclass) {
+  using Fn = int (*)();
+  static Fn fn = nullptr;
+  if (!fn) fn = reinterpret_cast<Fn>(Dmc4GpuSym("Rex4dtHeavyFrames"));
+  return fn ? fn() : -1;
+}
+
+// Debug recorder (lives in librexruntime.so): started / stopped by hand from the app.
+static void* Dmc4RuntimeSym(const char* name) {
+  static void* lib = nullptr;
+  if (!lib) lib = dlopen("librexruntime.so", RTLD_NOW | RTLD_NOLOAD);
+  void* sym = lib ? dlsym(lib, name) : nullptr;
+  return sym ? sym : Dmc4GpuSym(name);
+}
+
+extern "C" JNIEXPORT jboolean JNICALL
+Java_com_fourdeviltears_app_TouchGamepadView_nativeRecStart(JNIEnv* env, jclass, jstring path) {
+  using Fn = void (*)(const char*);
+  auto fn = reinterpret_cast<Fn>(Dmc4RuntimeSym("Rex4dtRecStart"));
+  if (!fn || !path) return 0;
+  const char* p = env->GetStringUTFChars(path, nullptr);
+  if (!p) return 0;
+  fn(p);
+  env->ReleaseStringUTFChars(path, p);
+  return 1;
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_com_fourdeviltears_app_TouchGamepadView_nativeRecStop(JNIEnv*, jclass) {
+  using Fn = void (*)();
+  if (auto fn = reinterpret_cast<Fn>(Dmc4RuntimeSym("Rex4dtRecStop"))) fn();
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_com_fourdeviltears_app_TouchGamepadView_nativeRecNote(JNIEnv* env, jclass, jstring text) {
+  using Fn = void (*)(const char*);
+  static Fn fn = nullptr;
+  if (!fn) fn = reinterpret_cast<Fn>(Dmc4RuntimeSym("Rex4dtRecNote"));
+  if (!fn || !text) return;
+  const char* t = env->GetStringUTFChars(text, nullptr);
+  if (!t) return;
+  fn(t);
+  env->ReleaseStringUTFChars(text, t);
 }
 
 // Write every draw of the next frame to a file (the touch layer asks for it when a tap
