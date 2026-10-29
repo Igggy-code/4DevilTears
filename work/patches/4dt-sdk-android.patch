@@ -15595,10 +15595,24 @@ index d358f39..2d11b12 100644
      auto result =
          rex::thread::WaitAny(std::move(wait_handles), alertable ? true : false, timeout_ms);
 diff --git a/src/system/xthread.cpp b/src/system/xthread.cpp
-index 77bce25..762d3fe 100644
+index 77bce25..7e65bdd 100644
 --- a/src/system/xthread.cpp
 +++ b/src/system/xthread.cpp
-@@ -574,6 +574,7 @@ void XThread::Execute() {
+@@ -37,6 +37,13 @@
+ #include <rex/thread.h>
+ #include <rex/vec128.h>
+ 
++// A low-priority guest thread polling with Sleep(0) wakes ~5000 times a second at the
++// 100 us nap below (heat on phones). Only a long streak of back-to-back zero delays is
++// slowed down to this nap; occasional Sleep(0) calls keep the short one.
++REXCVAR_DEFINE_INT32(idle_poll_sleep_us, REX_PLATFORM_ANDROID != 0 ? 1000 : 100, "Kernel",
++                     "Nap of a low-priority thread polling with Sleep(0) after 64 calls in a row")
++    .lifecycle(rex::cvar::Lifecycle::kHotReload);
++
+ REXCVAR_DEFINE_BOOL(ignore_thread_priorities, true, "Kernel",
+                     "Ignores game-specified thread priorities");
+ 
+@@ -574,6 +581,7 @@ void XThread::Execute() {
  
    // Let the kernel know we are starting.
    kernel_state_->OnThreadExecute(this);
@@ -15606,6 +15620,21 @@ index 77bce25..762d3fe 100644
  
    // Dispatch any APCs that were queued before the thread was created first.
    DeliverAPCs();
+@@ -1026,7 +1034,13 @@ X_STATUS XThread::Delay(uint32_t processor_mode, uint32_t alertable, uint64_t in
+   } else {
+     if (timeout_ms == 0) {
+       if (priority_ <= rex::thread::ThreadPriority::kBelowNormal) {
+-        rex::thread::Sleep(std::chrono::microseconds(100));
++        thread_local uint32_t streak = 0;
++        thread_local auto last = std::chrono::steady_clock::time_point();
++        auto now = std::chrono::steady_clock::now();
++        streak = (now - last < std::chrono::microseconds(2000)) ? streak + 1 : 0;
++        int32_t nap = REXCVAR_GET(idle_poll_sleep_us);
++        rex::thread::Sleep(std::chrono::microseconds(streak >= 64 && nap > 100 ? nap : 100));
++        last = std::chrono::steady_clock::now();
+       } else {
+         rex::thread::MaybeYield();
+       }
 diff --git a/src/ui/CMakeLists.txt b/src/ui/CMakeLists.txt
 index 5bd3dc5..3733ea5 100644
 --- a/src/ui/CMakeLists.txt
