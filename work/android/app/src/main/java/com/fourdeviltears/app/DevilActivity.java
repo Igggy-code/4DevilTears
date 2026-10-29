@@ -36,7 +36,7 @@ public class DevilActivity extends SDLActivity {
     static android.view.SurfaceView gameSurface() { return mSurface; }
 
     /** Read by TouchGamepadView: draw the FPS counter under the overlay toggle. */
-    static volatile boolean sShowFps = true;
+    static volatile boolean sShowFps = false;
     /** Read by TouchGamepadView: hide the controller during cutscenes and movies. */
     static volatile boolean sCinemaMode = true;
     /** Controller look (settings): opacity 0.2..1, fade when idle, essential buttons only. */
@@ -328,7 +328,7 @@ public class DevilActivity extends SDLActivity {
         android.widget.TextView overlayTitle = label("Overlay", 13, 0xFFE0453A, true);
         overlayTitle.setPadding(0, dpx(14), 0, dpx(0));
         settingsPanel.addView(overlayTitle);
-        settingsPanel.addView(switchRow("FPS counter", p.getBoolean(KEY_SHOW_FPS, true), (b, on) -> {
+        settingsPanel.addView(switchRow("FPS counter", p.getBoolean(KEY_SHOW_FPS, false), (b, on) -> {
             p.edit().putBoolean(KEY_SHOW_FPS, on).apply();
             sShowFps = on;
             if (gamepadView != null) gamepadView.invalidate();
@@ -528,7 +528,7 @@ public class DevilActivity extends SDLActivity {
         }
         // On-screen Xbox 360 controller over the game surface (hides itself while a
         // physical controller is connected).
-        sShowFps = prefs().getBoolean(KEY_SHOW_FPS, true);
+        sShowFps = prefs().getBoolean(KEY_SHOW_FPS, false);
         sDebugRec = prefs().getBoolean(KEY_DEV_MODE, false);
         // Cinema mode becomes the main mode: switched on once for everyone (also where it had
         // been turned off before); the switch in the settings still works afterwards.
