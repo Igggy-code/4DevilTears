@@ -2775,7 +2775,7 @@ index 0d8f8af..775bb46 100644
 +        OSDependent OGLCompiler)
 +endif()
 diff --git a/src/graphics/command_processor.cpp b/src/graphics/command_processor.cpp
-index a744375..0ccddfe 100644
+index a744375..5972d06 100644
 --- a/src/graphics/command_processor.cpp
 +++ b/src/graphics/command_processor.cpp
 @@ -10,6 +10,8 @@
@@ -2812,7 +2812,7 @@ index a744375..0ccddfe 100644
  using namespace rex::graphics::xenos;
  
  namespace {
-@@ -745,7 +758,13 @@ bool CommandProcessor::ExecutePacketType3(memory::RingBuffer* reader, uint32_t p
+@@ -745,7 +758,17 @@ bool CommandProcessor::ExecutePacketType3(memory::RingBuffer* reader, uint32_t p
    // the packet. Only type 3 packets are affected.
    // We also skip predicated swaps, as they are never valid (probably?).
    if (packet & 1) {
@@ -2821,13 +2821,17 @@ index a744375..0ccddfe 100644
 +    // draws the game culled to the other bands (their own passes are skipped).
 +    // Draws only: the per-band state (window offset, scissor...) also comes in predicated
 +    // packets and must keep its own band.
-+    bool is_draw = opcode == PM4_DRAW_INDX || opcode == PM4_DRAW_INDX_2;
++    // Resolves are draws in copy mode, one per band and predicated to it (each with its own
++    // destination rows and clear-after-copy) - they keep their band too.
++    bool is_draw = (opcode == PM4_DRAW_INDX || opcode == PM4_DRAW_INDX_2) &&
++                   register_file_->Get<reg::RB_MODECONTROL>().edram_mode !=
++                       xenos::EdramMode::kCopy;
 +    uint64_t select = (g_4dt_predication_all_bins && is_draw) ? ~uint64_t(0) : bin_select_;
 +    bool any_pass = (select & bin_mask_) != 0;
      if (!any_pass || opcode == PM4_XE_SWAP) {
        reader->AdvanceRead(count * sizeof(uint32_t));
        return true;
-@@ -1036,8 +1055,24 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
+@@ -1036,8 +1059,24 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
          if (!REXCVAR_GET(vsync)) {
            // User wants it fast and dangerous.
            rex::thread::MaybeYield();
@@ -9126,7 +9130,7 @@ index 0000000..4812f2a
 +
 +}  // namespace rex::graphics::vulkan::bc_decode
 diff --git a/src/graphics/vulkan/command_processor.cpp b/src/graphics/vulkan/command_processor.cpp
-index 001f36b..571780e 100644
+index 001f36b..4fe82d9 100644
 --- a/src/graphics/vulkan/command_processor.cpp
 +++ b/src/graphics/vulkan/command_processor.cpp
 @@ -9,7 +9,10 @@
@@ -10861,7 +10865,7 @@ index 001f36b..571780e 100644
    in_render_pass_ = false;
  }
  
-@@ -3587,13 +5119,316 @@ Shader* VulkanCommandProcessor::LoadShader(xenos::ShaderType shader_type, uint32
+@@ -3587,13 +5119,320 @@ Shader* VulkanCommandProcessor::LoadShader(xenos::ShaderType shader_type, uint32
    return pipeline_cache_->LoadShader(shader_type, host_address, dword_count);
  }
  
@@ -11108,11 +11112,13 @@ index 001f36b..571780e 100644
 +      {
 +        Shader* clear_vs = active_vertex_shader();
 +        auto vte = bregs.Get<reg::PA_CL_VTE_CNTL>();
-+        (void)vte;  // the D3D clear rectangle follows the viewport registers either way
++        // Also any other band-local quad (post-processing of the band's HDR target...): a
++        // viewport covering exactly the first band. Scene draws use the full-screen viewport.
++        // The D3D clear follows the viewport registers even with the viewport transform off.
++        bool is_clear = clear_vs && clear_vs->ucode_data_hash() == UINT64_C(0x0A6D1DD7767FDF27);
 +        if (it != g_band_collapse.configs_previous.end() && g_band_collapse.Ready(it->second) &&
-+            clear_vs &&
-+            clear_vs->ucode_data_hash() == UINT64_C(0x0A6D1DD7767FDF27) &&
-+            scissor_br.br_y > it->second.first_band_bottom &&
++            (is_clear || (vte.vport_y_scale_ena && vte.vport_y_offset_ena)) &&
++            scissor_br.br_y >= it->second.first_band_bottom &&
 +            it->second.full_bottom > it->second.first_band_bottom) {
 +          float yscale, yoffset;
 +          std::memcpy(&yscale, &bregs[XE_GPU_REG_PA_CL_VPORT_YSCALE], 4);
@@ -11128,10 +11134,12 @@ index 001f36b..571780e 100644
 +            band_override.Set(XE_GPU_REG_PA_CL_VPORT_YSCALE, bits);
 +            std::memcpy(&bits, &new_offset, 4);
 +            band_override.Set(XE_GPU_REG_PA_CL_VPORT_YOFFSET, bits);
-+            stretched_clear = true;
-+            static uint32_t logged_clears = 0;
-+            if (logged_clears++ < 8) {
-+              REXGPU_INFO("BAND clear stretched: surf {:05X} rows {} -> {}", uint32_t(key),
++            stretched_clear = is_clear;
++            static uint32_t logged_stretches = 0;
++            if (logged_stretches++ < 16) {
++              REXGPU_INFO("BAND {} stretched: surf {:05X} vs {:016X} rows {} -> {}",
++                          is_clear ? "clear" : "band quad", uint32_t(key),
++                          clear_vs ? clear_vs->ucode_data_hash() : 0,
 +                          it->second.first_band_bottom, it->second.full_bottom);
 +            }
 +          }
@@ -11179,7 +11187,7 @@ index 001f36b..571780e 100644
    const RegisterFile& regs = *register_file_;
    (void)index_buffer_info;
    auto draw_fail = [&](const char* stage) {
-@@ -3629,13 +5464,68 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
+@@ -3629,13 +5468,68 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
      return draw_fail("missing_vertex_shader");
    }
    pipeline_cache_->AnalyzeShaderUcode(*vertex_shader);
@@ -11252,7 +11260,7 @@ index 001f36b..571780e 100644
      }
      draw_util::AddMemExportRanges(regs, *vertex_shader, memexport_ranges_);
    }
-@@ -3681,6 +5571,365 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
+@@ -3681,6 +5575,365 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
    }
    reg::RB_DEPTHCONTROL normalized_depth_control = draw_util::GetNormalizedDepthControl(regs);
  
@@ -11618,7 +11626,7 @@ index 001f36b..571780e 100644
    uint32_t ps_param_gen_pos = UINT32_MAX;
    uint32_t interpolator_mask =
        pixel_shader ? (vertex_shader->writes_interpolators() &
-@@ -3835,6 +6084,7 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
+@@ -3835,6 +6088,7 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
    uint32_t used_texture_mask =
        vertex_shader->GetUsedTextureMaskAfterTranslation() |
        (pixel_shader != nullptr ? pixel_shader->GetUsedTextureMaskAfterTranslation() : 0);
@@ -11626,7 +11634,7 @@ index 001f36b..571780e 100644
    texture_cache_->RequestTextures(used_texture_mask);
  
    const VulkanPipelineCache::PipelineLayoutProvider* pipeline_layout_provider;
-@@ -4111,14 +6361,22 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
+@@ -4111,14 +6365,22 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
    // After all commands that may dispatch, copy or insert barriers, submit
    // the barriers (may end the render pass), and (re)enter the render pass
    // before drawing.
@@ -11649,7 +11657,7 @@ index 001f36b..571780e 100644
      deferred_command_buffer_.CmdVkDraw(primitive_processing_result.host_draw_vertex_count, 1, 0, 0);
    } else {
      std::pair<VkBuffer, VkDeviceSize> index_buffer;
-@@ -4150,10 +6408,33 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
+@@ -4150,10 +6412,33 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
          primitive_processing_result.host_index_format == xenos::IndexFormat::kInt16
              ? VK_INDEX_TYPE_UINT16
              : VK_INDEX_TYPE_UINT32);
@@ -11683,7 +11691,7 @@ index 001f36b..571780e 100644
    // Invalidate textures in memexported memory and watch for changes.
    if (!memexport_ranges_.empty()) {
      for (const draw_util::MemExportRange& memexport_range : memexport_ranges_) {
-@@ -4382,6 +6663,63 @@ bool VulkanCommandProcessor::IssueDraw_MemexportReadbackFastPath(uint32_t total_
+@@ -4382,6 +6667,66 @@ bool VulkanCommandProcessor::IssueDraw_MemexportReadbackFastPath(uint32_t total_
  }
  
  bool VulkanCommandProcessor::IssueCopy() {
@@ -11721,7 +11729,10 @@ index 001f36b..571780e 100644
 +      auto scissor_tl = bregs.Get<reg::PA_SC_WINDOW_SCISSOR_TL>();
 +      auto scissor_br = bregs.Get<reg::PA_SC_WINDOW_SCISSOR_BR>();
 +      uint32_t dest_height = (bregs[XE_GPU_REG_RB_COPY_DEST_PITCH] >> 16) & 0x3FFF;
-+      if (it != g_band_collapse.configs_previous.end() && scissor_tl.tl_y == 0 &&
++      // Not a copy that clears after itself (the band's final resolve): it would clear the
++      // rows of the other bands before their own resolves read them.
++      bool clears_after = (bregs[XE_GPU_REG_RB_COPY_CONTROL] & 0x300) != 0;
++      if (it != g_band_collapse.configs_previous.end() && !clears_after && scissor_tl.tl_y == 0 &&
 +          scissor_br.br_y == it->second.first_band_bottom &&
 +          it->second.full_bottom > scissor_br.br_y) {
 +        reg::PA_SC_WINDOW_SCISSOR_BR new_br = scissor_br;
@@ -11747,7 +11758,7 @@ index 001f36b..571780e 100644
  #if XE_GPU_FINE_GRAINED_DRAW_SCOPES
    SCOPE_profile_cpu_f("gpu");
  #endif  // XE_GPU_FINE_GRAINED_DRAW_SCOPES
-@@ -4393,8 +6731,22 @@ bool VulkanCommandProcessor::IssueCopy() {
+@@ -4393,8 +6738,22 @@ bool VulkanCommandProcessor::IssueCopy() {
    ReadbackResolveMode readback_mode = GetReadbackResolveMode(REXCVAR_GET(vulkan_readback_resolve));
    if (readback_mode == ReadbackResolveMode::kDisabled) {
      uint32_t written_address, written_length;
@@ -11772,7 +11783,7 @@ index 001f36b..571780e 100644
    }
  
    return IssueCopy_ReadbackResolvePath();
-@@ -5016,6 +7368,77 @@ void VulkanCommandProcessor::CheckSubmissionFenceAndDeviceLoss(uint64_t await_su
+@@ -5016,6 +7375,77 @@ void VulkanCommandProcessor::CheckSubmissionFenceAndDeviceLoss(uint64_t await_su
                                        submissions_in_flight_fences_awaited_end);
    submission_completed_ += fences_awaited;
  
@@ -11850,7 +11861,7 @@ index 001f36b..571780e 100644
    // Reclaim semaphores.
    while (!submissions_in_flight_semaphores_.empty()) {
      const auto& semaphore_submission = submissions_in_flight_semaphores_.front();
-@@ -5136,6 +7559,29 @@ bool VulkanCommandProcessor::BeginSubmission(bool is_guest_command) {
+@@ -5136,6 +7566,29 @@ bool VulkanCommandProcessor::BeginSubmission(bool is_guest_command) {
      // the end of the submission (when async pipeline object creation requests
      // are fulfilled).
      deferred_command_buffer_.Reset();
@@ -11880,7 +11891,7 @@ index 001f36b..571780e 100644
  
      // Reset cached state of the command buffer.
      dynamic_viewport_update_needed_ = true;
-@@ -5150,6 +7596,7 @@ bool VulkanCommandProcessor::BeginSubmission(bool is_guest_command) {
+@@ -5150,6 +7603,7 @@ bool VulkanCommandProcessor::BeginSubmission(bool is_guest_command) {
      dynamic_stencil_reference_back_update_needed_ = true;
      current_render_pass_ = VK_NULL_HANDLE;
      current_framebuffer_ = nullptr;
@@ -11888,7 +11899,7 @@ index 001f36b..571780e 100644
      in_render_pass_ = false;
      current_guest_graphics_pipeline_ = VK_NULL_HANDLE;
      current_external_graphics_pipeline_ = VK_NULL_HANDLE;
-@@ -5385,7 +7832,81 @@ bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
+@@ -5385,7 +7839,81 @@ bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
        REXGPU_ERROR("Failed to begin a Vulkan command buffer");
        return false;
      }
