@@ -11,7 +11,7 @@
   <img alt="Arch" src="https://img.shields.io/badge/arch-arm64--v8a-555">
   <img alt="Graphics" src="https://img.shields.io/badge/graphics-Vulkan%201.1-AC162C?logo=vulkan&logoColor=white">
   <img alt="GPUs" src="https://img.shields.io/badge/GPU-Mali%20%C2%B7%20Adreno-0b5fa5">
-  <img alt="Version" src="https://img.shields.io/badge/version-0.7-6a1b9a">
+  <img alt="Version" src="https://img.shields.io/badge/version-0.8-6a1b9a">
   <img alt="Status" src="https://img.shields.io/badge/status-in%20development-orange">
 </p>
 
@@ -39,9 +39,9 @@ of the game into a ready-to-play installation.
 | 🌍 **Editions** | The original release and the Russian fan translation (same executable, translated text and voices). |
 | 🎮 **Controls** | On-screen Xbox 360 controller with opacity, fade-when-idle and *essential buttons only* modes. Bluetooth / USB gamepads work out of the box. |
 | 🎬 **Cinema mode** | On by default. No controls over logos, movies, cutscenes, loading screens and menus — tap once, tap again to skip a cutscene. The controller only shows up in gameplay. |
-| 👆 **Touch menus** | Menus are recognised from what the game draws, so taps follow the game's own layout on every screen: tap a list item to select it, tap again to confirm; arrows and values change at once; save slots; the button prompts at the bottom work as those buttons. Swipes and two-finger *back* still work everywhere. |
+| 👆 **Touch menus** | Menus are recognised from what the game draws, so taps follow the game's own layout on every screen: tap a list item to select it, tap again to confirm; arrows and values change at once; save slots, word choices (save / load, yes / no), tabs and the button prompts work as those buttons. Tutorial pop-ups close with a tap. Swipes and two-finger *back* still work everywhere. |
 | ✨ **TAP to START** | The title screen asks you to *tap*, not to press a button — rebuilt on the device from the game's own lettering. |
-| 🖼️ **Display** | Original 16:9, fill or stretch; optional 30 FPS lock for steadier frame pacing; FPS counter. |
+| 🖼️ **Display** | Full screen without distortion, original 16:9, fill or stretch; optional 30 FPS lock (40 FPS on 120 Hz displays) with Android performance hints for steadier frame pacing; FPS counter. |
 | 🔊 **Audio** | 5.1 soundtracks folded to stereo on the device, so dialogue (center channel) is never lost on phone speakers. |
 
 ## How it works
@@ -69,7 +69,7 @@ flowchart LR
    when a cutscene, a movie or a menu is on screen, reads the menu cursor and maps taps to
    menu items — without changing the game's own logic.
 5. **Android app.** Import screen, game activity on SDL3, touch controller, cinema mode,
-   settings panel (Back button or long-press on ◐).
+   settings panel (Back button or back gesture).
 
 ## Getting started
 
@@ -100,17 +100,6 @@ bash work/install_android.sh
 | `work/build_android.sh` · `work/install_android.sh` | Build, install, logs, frame traces, automated tests |
 | `work/bench` | Automated test sets (gameplay / cutscene benchmarks) |
 | `tools` | Disc & Games on Demand unpacker, MT Framework `.arc` extractor, analysis helpers |
-
-## Status
-
-- [x] Boots, plays cutscenes and missions on Pixel 8 (Mali-G715)
-- [x] Import from `.iso` and Games on Demand folders
-- [x] Touch controller, cinema mode, touch menus (title, mission, pause)
-- [x] Voices and 5.1 audio on phone speakers
-- [ ] Touch for the remaining menus (options, library, shop, save / load)
-- [ ] Steady 60 FPS in combat; open areas
-- [ ] Real widescreen for tall phone screens
-- [ ] Russian edition: re-encoded voice tracks that the decoder can't read yet
 
 ## Legal
 
