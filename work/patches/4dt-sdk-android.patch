@@ -3701,10 +3701,10 @@ index 76f5600..f1d8121 100644
    }
 diff --git a/src/graphics/pipeline/texture/title_patch.cpp b/src/graphics/pipeline/texture/title_patch.cpp
 new file mode 100644
-index 0000000..5c096c7
+index 0000000..c8a92c6
 --- /dev/null
 +++ b/src/graphics/pipeline/texture/title_patch.cpp
-@@ -0,0 +1,309 @@
+@@ -0,0 +1,327 @@
 +/**
 + * [4DevilTears] "PRESS START BUTTON" -> "TAP to START" on the Devil May Cry 4 title screen.
 + *
@@ -3948,6 +3948,24 @@ index 0000000..5c096c7
 +                Px{c[0] / 255.0f * a, c[1] / 255.0f * a, c[2] / 255.0f * a, a});
 +      }
 +    REXGPU_INFO("title: Нажмите Любую Кнопку -> Коснитесь Экрана");
++    // The translation swapped the two states of the menu captions in this atlas: the cursor
++    // row came out dull and the others bright. Each caption is drawn twice, one block above
++    // the other - swap the blocks back (texels, x0..x1, rows y0..y0+h <-> y0+h..y0+2h):
++    //   main menu (Новая игра / Загрузить игру / Опции), 3 rows of 56 per state;
++    //   Вкл / Выкл; Человек; Охотник на демонов (the new game screens).
++    struct Swap {
++      int x0, x1, y0, h;
++    };
++    const Swap swaps[] = {{0, 416, 0, 168}, {512, 1024, 224, 48}, {720, 1024, 128, 48},
++                          {640, 1024, 376, 48}};
++    for (const Swap& sw : swaps)
++      for (int y = sw.y0; y < sw.y0 + sw.h; ++y)
++        for (int x = sw.x0; x < sw.x1; ++x) {
++          uint8_t* a = TexelPtr(guest_texture, x, y);
++          uint8_t* b = TexelPtr(guest_texture, x, y + sw.h);
++          for (int i = 0; i < 4; ++i) std::swap(a[i], b[i]);
++        }
++    REXGPU_INFO("title: menu caption states swapped back (Russian translation)");
 +    return true;
 +  }
 +  if (h != kSignature) {
