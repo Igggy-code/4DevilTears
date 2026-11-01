@@ -138,8 +138,10 @@ void Dmc4UiCaptureSprite(PPCContext& ctx, uint8_t* base) {
   }
 }
 
+void Dmc4RenderScaleTick();  // dmc4_widescreen.cpp
 extern "C" void __imp__sub_82784BD8(PPCContext& __restrict ctx, uint8_t* base);
 extern "C" void sub_82784BD8(PPCContext& __restrict ctx, uint8_t* base) {
+  Dmc4RenderScaleTick();
   Dmc4UiCaptureSprite(ctx, base);
   if (g_in_title_draw.load() && g_sprite_log_budget.load() > 0) {
     g_sprite_log_budget.fetch_sub(1);
@@ -184,7 +186,9 @@ void CockpitReport(uint8_t* base) {
 }  // namespace
 
 extern "C" void __imp__sub_827B0208(PPCContext& __restrict ctx, uint8_t* base);
+std::atomic<int64_t> g_cock_update_ms{0};  // gameplay HUD update (runs while playing)
 extern "C" void sub_827B0208(PPCContext& __restrict ctx, uint8_t* base) {
+  g_cock_update_ms.store(NowMs());
   g_cock_self.store(ctx.r3.u32);
   g_cock_move.fetch_add(1);
   CockpitReport(base);

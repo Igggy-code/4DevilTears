@@ -9,6 +9,9 @@
 
 #if defined(__ANDROID__)
 #include <SDL3/SDL_system.h>
+
+// dmc4_ru_subs.cpp: corrected subtitles for the Russian edition (no-op for other editions).
+bool Dmc4ApplyRuSubtitles(const std::filesystem::path& game_root);
 #endif
 
 class Dmc4App : public rex::ReXApp {
@@ -34,6 +37,14 @@ class Dmc4App : public rex::ReXApp {
     }
 #else
     (void)paths;
+#endif
+  }
+
+  void OnPreLaunchModule() override {
+#if defined(__ANDROID__)
+    // Last step before the game starts reading its files: for the Russian edition, install
+    // the corrected subtitles into the unpacked game (done once; quick no-op afterwards).
+    Dmc4ApplyRuSubtitles(game_data_root());
 #endif
   }
 

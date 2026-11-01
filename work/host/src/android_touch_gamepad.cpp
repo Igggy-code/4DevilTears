@@ -5,6 +5,8 @@
 // driver picks them up exactly like a physical controller.
 #if defined(__ANDROID__)
 
+#include <chrono>
+#include <dlfcn.h>
 #include <jni.h>
 
 #include <mutex>
@@ -14,6 +16,7 @@
 #include <SDL3/SDL.h>
 
 #include <rex/cvar.h>
+#include <rex/logging.h>
 #include <rex/kernel/scene_state.h>
 #include <rex/perf/counter.h>
 
@@ -25,6 +28,7 @@ extern std::atomic<bool> g_rex_android_surface_alive;
 extern std::atomic<uint32_t> g_rex_android_surface_generation;
 
 int Dmc4SceneMode();  // dmc4_menu_hooks.cpp
+extern std::atomic<int64_t> g_cock_update_ms;  // dmc4_menu_hooks.cpp: last gameplay HUD update
 
 namespace {
 
@@ -116,11 +120,77 @@ JNIEXPORT jfloat JNICALL Java_com_fourdeviltears_app_TouchGamepadView_nativeFps(
 }
 
 // What the game shows: 0 gameplay/menus, 1 in-engine cutscene, 2 pre-rendered movie.
+// Game message boxes (XamShowMessageBoxUI: "overwrite this save?" and the like) as a native
+// dialog of the app: DevilActivity.showGameMessage blocks this worker thread until a button is
+// tapped. Registered with the runtime on the first scene poll.
+static int Dmc4MessageBoxC(const char* title, const char* text, const char* const* buttons, int count,
+                           int active) {
+  // Plain notices with a single OK (Xbox Live sign-in / storage device info) need no answer:
+  // confirmed silently, as before. Only real choices (Yes / No...) are shown.
+  if (count <= 1) return active;
+  JNIEnv* env = static_cast<JNIEnv*>(SDL_GetAndroidJNIEnv());
+  jobject activity = static_cast<jobject>(SDL_GetAndroidActivity());
+  if (!env || !activity) return active;
+  int chosen = active;
+  jclass cls = env->GetObjectClass(activity);
+  jmethodID m = env->GetMethodID(cls, "showGameMessage",
+                                 "(Ljava/lang/String;Ljava/lang/String;[Ljava/lang/String;I)I");
+  if (m) {
+    jclass str = env->FindClass("java/lang/String");
+    jobjectArray arr = env->NewObjectArray(count, str, nullptr);
+    for (int i = 0; i < count; ++i) {
+      jstring b = env->NewStringUTF(buttons[i] ? buttons[i] : "");
+      env->SetObjectArrayElement(arr, i, b);
+      env->DeleteLocalRef(b);
+    }
+    jstring t = env->NewStringUTF(title ? title : "");
+    jstring x = env->NewStringUTF(text ? text : "");
+    chosen = env->CallIntMethod(activity, m, t, x, arr, jint(active));
+    if (env->ExceptionCheck()) { env->ExceptionClear(); chosen = active; }
+    env->DeleteLocalRef(t);
+    env->DeleteLocalRef(x);
+    env->DeleteLocalRef(arr);
+    env->DeleteLocalRef(str);
+  } else if (env->ExceptionCheck()) {
+    env->ExceptionClear();
+  }
+  env->DeleteLocalRef(cls);
+  env->DeleteLocalRef(activity);
+  return chosen;
+}
+
+static void Dmc4RegisterMessageBox() {
+  static std::atomic<bool> done{false};
+  if (done.load()) return;
+  void* lib = dlopen("librexruntime.so", RTLD_NOW | RTLD_NOLOAD);
+  using SetFn = void (*)(int (*)(const char*, const char*, const char* const*, int, int));
+  auto set = reinterpret_cast<SetFn>(lib ? dlsym(lib, "Rex4dtSetMessageBoxFn") : nullptr);
+  if (!set) set = reinterpret_cast<SetFn>(dlsym(RTLD_DEFAULT, "Rex4dtSetMessageBoxFn"));
+  if (set) { set(&Dmc4MessageBoxC); done.store(true); }
+}
+
 JNIEXPORT jint JNICALL Java_com_fourdeviltears_app_TouchGamepadView_nativeSceneMode(JNIEnv*, jclass) {
+  Dmc4RegisterMessageBox();
   // The game's own cutscene / movie units first; the open-file heuristic only as a fallback
   // for a movie (its file is open exactly while it plays).
   int mode = Dmc4SceneMode();
   if (mode == 0 && rex::kernel::scene::CurrentMode() == 2) mode = 2;
+  // Some in-engine cutscenes (e.g. m03_110m, the mission 3 dragon) are not run by
+  // uDemoCutCtrl: there, a cutscene soundtrack (sound\demo) is open while the gameplay HUD
+  // is not updated. The HUD check keeps it off when the soundtrack outlives the cutscene.
+  if (mode == 0 && rex::kernel::scene::CurrentMode() == 1) {
+    const int64_t now = std::chrono::duration_cast<std::chrono::milliseconds>(
+                            std::chrono::steady_clock::now().time_since_epoch())
+                            .count();
+    if (now - g_cock_update_ms.load() > 600) mode = 1;
+  }
+  // Each change of the fallback verdict goes to the log (false positives can be found there).
+  static std::atomic<int> logged{-1};
+  const int fallback = (mode == 1 && Dmc4SceneMode() == 0) ? 1 : 0;
+  if (logged.exchange(fallback) != fallback) {
+    __android_log_print(ANDROID_LOG_INFO, LOG_TAG, "scene fallback %d", fallback);
+    REXKRNL_INFO("SCENE3 cutscene by soundtrack + no HUD: {}", fallback ? "on" : "off");
+  }
   return mode;
 }
 
