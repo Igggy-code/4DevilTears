@@ -118,7 +118,10 @@ copy_if_changed() { cmp -s "$1" "$2" || cp -f "$1" "$2"; }
 copy_if_changed "$XEX" "$PROJ/default.xex"
 copy_if_changed "$WORK/dmc4_manifest.toml" "$PROJ/dmc4_manifest.toml"
 copy_if_changed "$WORK/host/CMakeLists.txt" "$PROJ/CMakeLists.txt"
-for f in "$WORK"/host/src/*; do copy_if_changed "$f" "$PROJ/src/$(basename "$f")"; done
+for f in "$WORK"/host/src/*; do
+  if [ -d "$f" ]; then mkdir -p "$PROJ/src/$(basename "$f")"; cp -Rp "$f/." "$PROJ/src/$(basename "$f")/"   # third_party/...
+  else copy_if_changed "$f" "$PROJ/src/$(basename "$f")"; fi
+done
 if [ ! -f "$PROJ/generated/rexglue.cmake" ] || [ "$PROJ/dmc4_manifest.toml" -nt "$PROJ/generated/default/codegen.stamp" ]; then
   (cd "$PROJ" && "$HOST_REXGLUE" codegen dmc4_manifest.toml) || fail "codegen"
 fi
@@ -151,6 +154,10 @@ fi
 cp -f "$(find "$OBJ" "$SDK_PREFIX" -name librexgpu-xenos.so | head -1)" "$LIBS/" || fail "нет librexgpu-xenos.so"
 cp -f "$(find "$SDK_PREFIX" "$SDK_OBJ" -name librexruntime.so | head -1)" "$LIBS/" || fail "нет librexruntime.so"
 cp -f "$(find "$NDK/toolchains/llvm/prebuilt" -path "*aarch64-linux-android/libc++_shared.so" | head -1)" "$LIBS/" || fail "нет libc++_shared.so"
+# libadrenotools: библиотеки-перехватчики для своих драйверов Vulkan на Adreno (Turnip и др.)
+for h in hook_impl main_hook file_redirect_hook gsl_alloc_hook; do
+  cp -f "$(find "$SDK/out" -name "lib$h.so" -path "*android-arm64*" | head -1)" "$LIBS/" || fail "нет lib$h.so"
+done
 step "Набор для сборки кода игры на телефоне"
 NDK="$NDK" bash "$WORK/make_kit.sh" "$APP" || fail "make_kit.sh"
 ls -la "$LIBS"
