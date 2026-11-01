@@ -91,13 +91,18 @@ final class UiTouch {
     private int choiceSel = -1;
     private Line selected;
     private boolean selectedByBar, selectedByColor;
+    // Selection only guessed (several rows show value digits / arrows, nothing else marks the
+    // selected one - e.g. the skill shop lists with prices): the game's own list cursor, when
+    // known (set by the view before tap()), is the selected row then.
+    private boolean selectedWeak;
+    int gameCursor = -1;
     private int count = -1;
 
     /** Reads the sprites of the last frame and recognises the menu parts. */
     boolean refresh() {
         try { count = TouchGamepadView.nativeUiSprites(buf); }
         catch (UnsatisfiedLinkError e) { count = -1; }
-        sprites.clear(); lines.clear(); prompts.clear(); selected = null; selectedByBar = false; selectedByColor = false;
+        sprites.clear(); lines.clear(); prompts.clear(); selected = null; selectedByBar = false; selectedByColor = false; selectedWeak = false;
         choice.clear(); choiceSel = -1;
         if (count <= 0) return false;
         for (int i = 0; i < count; i++) {
@@ -374,6 +379,28 @@ final class UiTouch {
             upper.add(s);
             if (s.h() >= 24 && s.h() <= 52 && s.w() >= 100) text.add(s);
         }
+        // Tall word sprites (mission result menu: Record / Mission Menu / Next, 56 px high) are
+        // rows only where a cursor ornament of the same atlas sits on one of them - then they
+        // are the whole list (the result table around them is not).
+        {
+            List<S> tall = new ArrayList<>();
+            for (S s : upper) {
+                if (s.h() > 52 && s.h() <= 60 && s.w() >= 100 && (s.color >>> 24) != 0) tall.add(s);
+            }
+            S tallBar = null;
+            for (S bar : upper) {
+                if (bar.w() < 200 || bar.h() > 90) continue;
+                for (S t : tall) {
+                    if (t != bar && t.tex == bar.tex && bar.h() >= t.h() + 6 && Math.abs(t.cy() - bar.cy()) < 14
+                            && Math.min(t.x1, bar.x1) > Math.max(t.x0, bar.x0)) { tallBar = bar; break; }
+                }
+                if (tallBar != null) break;
+            }
+            if (tallBar != null) {
+                text.clear();
+                for (S t : tall) if (t.tex == tallBar.tex) text.add(t);
+            }
+        }
         int mh = 40;
         if (!text.isEmpty()) {
             List<Integer> hs = new ArrayList<>();
@@ -454,7 +481,9 @@ final class UiTouch {
         }
         if (selected == null && lines.size() == 1) selected = lines.get(0);
         if (selected == null) {
-            for (Line l : lines) if (!l.arrows.isEmpty()) { selected = l; break; }
+            int withArrows = 0;
+            for (Line l : lines) if (!l.arrows.isEmpty()) { if (selected == null) selected = l; withArrows++; }
+            selectedWeak = withArrows > 1;
         }
         // Horizontal strips of equal tiles (save / load slots...): 3+ same-size sprites on one
         // line at a regular spacing; the selected tile is the one a bigger frame sits on.
@@ -788,9 +817,11 @@ final class UiTouch {
             if (gx < l.x0 - 40 || gx > right + 40) continue;
             if (selected == null) return log(NONE, gx, gy);
             int sel = lines.indexOf(selected);
-            if (l == selected) {
+            if (selectedWeak && gameCursor >= 0 && gameCursor < lines.size()) sel = gameCursor;
+            if (i == sel) {
                 // The value part of the selected row: left / right half change it at once.
-                if (!l.arrows.isEmpty()) {
+                // (Not on price lists: their "values" are digits, left / right switch the page.)
+                if (!l.arrows.isEmpty() && !selectedWeak) {
                     float lo = Collections.min(l.arrows, (a, b) -> a.x0 - b.x0).x0;
                     float hi = Collections.max(l.arrows, (a, b) -> a.x1 - b.x1).x1;
                     if (gx >= lo - 10 && gx <= hi + 10) {

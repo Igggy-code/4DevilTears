@@ -484,6 +484,7 @@ public class TouchGamepadView extends View implements InputManager.InputDeviceLi
         rec = new Ctl(K_TOGGLE, 0, "REC", 0xFFE0453A);
         uiShot = new Ctl(K_TOGGLE, 0, "UI", 0xFF4AA3E0);
         gfxShot = new Ctl(K_TOGGLE, 0, "GFX", 0xFF6CC24A);
+        logSave = new Ctl(K_TOGGLE, 0, "LOG", 0xFFE0B040);
 
         setFocusable(false);
         handler.post(attachPoll);
@@ -492,6 +493,9 @@ public class TouchGamepadView extends View implements InputManager.InputDeviceLi
 
     // FPS counter (guest frames per second, published by the GPU backend).
     private float fps = -1f;
+    private final float[] fpsFrameMs = new float[10];  // one sample per tick (100 ms)
+    private int fpsCount = 0;
+    private long fpsShownAt = 0;
     private final Paint fpsPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
     private final Runnable fpsPoll = new Runnable() {
         @Override public void run() {
@@ -500,7 +504,21 @@ public class TouchGamepadView extends View implements InputManager.InputDeviceLi
                 // reads the frame rate, not single frame-to-frame jitter.
                 float raw;
                 try { raw = nativeFps(); } catch (UnsatisfiedLinkError e) { raw = -1f; }
-                fps = raw <= 0 ? raw : (fps <= 0 ? raw : fps + (raw - fps) * 0.25f);
+                // Shown as the average over the last second (frame times, not rates), updated
+                // twice a second - a per-frame figure jumps with every uneven frame.
+                if (raw <= 0) { fps = raw; fpsCount = 0; }
+                else {
+                    fpsFrameMs[fpsCount % fpsFrameMs.length] = 1000f / raw;
+                    fpsCount++;
+                    long nowFps = System.currentTimeMillis();
+                    if (fps <= 0 || nowFps - fpsShownAt >= 500) {
+                        int n = Math.min(fpsCount, fpsFrameMs.length);
+                        float sum = 0;
+                        for (int i = 0; i < n; i++) sum += fpsFrameMs[i];
+                        fps = sum > 0 ? 1000f * n / sum : raw;
+                        fpsShownAt = nowFps;
+                    }
+                }
                 try { sceneMode = nativeSceneMode(); } catch (UnsatisfiedLinkError e) { sceneMode = 0; }
                 try { menuState = nativeMenuState(); } catch (UnsatisfiedLinkError e) { menuState = 0; }
                 try { listVt = nativeListMenu(); } catch (UnsatisfiedLinkError e) { listVt = 0; }
@@ -609,7 +627,7 @@ public class TouchGamepadView extends View implements InputManager.InputDeviceLi
         fpsPaint.setFakeBoldText(true);
         fpsPaint.setTextSize(13 * dp);
         fpsPaint.setColor(fps >= 25 ? 0xCC7CFC00 : (fps >= 15 ? 0xCCFFD700 : 0xCCFF5050));
-        canvas.drawText(String.format(java.util.Locale.US, "%.1f FPS", fps),
+        canvas.drawText(String.format(java.util.Locale.US, "%d FPS", Math.round(fps)),
                 toggle.cx, toggle.cy + toggle.r + 16 * dp, fpsPaint);
     }
 
@@ -698,6 +716,9 @@ public class TouchGamepadView extends View implements InputManager.InputDeviceLi
         // (screenshot + one-frame GPU trace of the frame as it is).
         place(uiShot, side + 22 * s, top + bh + 84 * s, 16 * s);
         place(gfxShot, side + 22 * s, top + bh + 128 * s, 16 * s);
+        // Save diagnostics (zip of logs and captures): one free slot lower - the next slot is
+        // where a camera cut-out usually sits on the left edge in landscape.
+        place(logSave, side + 22 * s, top + bh + 216 * s, 16 * s);
 
         place(dpad, 275 * s, h - 80 * s, 62 * s);
 
@@ -738,6 +759,12 @@ public class TouchGamepadView extends View implements InputManager.InputDeviceLi
                 }
                 if (DevilActivity.sDebugRec && gfxShot != null && gfxShot.hit(x, y, 8 * dp)) {
                     captureGfx();
+                    return true;
+                }
+                if (DevilActivity.sDebugRec && logSave != null && logSave.hit(x, y, 8 * dp)) {
+                    logSaveAt = System.currentTimeMillis();
+                    invalidate();
+                    if (getContext() instanceof DevilActivity) ((DevilActivity) getContext()).saveDiagnostics();
                     return true;
                 }
                 if (physicalPadConnected()) {
@@ -796,6 +823,7 @@ public class TouchGamepadView extends View implements InputManager.InputDeviceLi
         Ctl hot = start.hit(x, y, 8 * dp) ? start : (a.hit(x, y, 8 * dp) ? a : null);
         if (hot != null && uiMenu) {
             float[] g = toGame(x, y);
+            ui.gameCursor = gameCursor();
             UiTouch.Action act = ui.tap(g[0], g[1]);
             if (act != null && act.button >= 0) hot = null;
         }
@@ -839,6 +867,7 @@ public class TouchGamepadView extends View implements InputManager.InputDeviceLi
         boolean titleMain = title && ((menuState >> 8) & 0xFF) == 7;
         if (!titleMain && ui.refresh()) {
             float[] g = toGame(x, y);
+            ui.gameCursor = gameCursor();
             UiTouch.Action act = ui.tap(g[0], g[1]);
             if (act != null) {
                 if (act.button < 0) captureScreen();
@@ -925,8 +954,8 @@ public class TouchGamepadView extends View implements InputManager.InputDeviceLi
     }
 
     // ---- debug captures: UI (sprites) and GFX (GPU frame trace), with a screenshot each ----
-    private Ctl uiShot, gfxShot;
-    private long uiShotAt = 0, gfxShotAt = 0;
+    private Ctl uiShot, gfxShot, logSave;
+    private long uiShotAt = 0, gfxShotAt = 0, logSaveAt = 0;
 
     private static String stamp() {
         return new java.text.SimpleDateFormat("HHmmss", java.util.Locale.US).format(new java.util.Date());
@@ -1016,6 +1045,7 @@ public class TouchGamepadView extends View implements InputManager.InputDeviceLi
         if (!DevilActivity.sDebugRec || rec == null) return;
         if (uiShot != null) drawShotButton(cv, uiShot, uiShotAt);
         if (gfxShot != null) drawShotButton(cv, gfxShot, gfxShotAt);
+        if (logSave != null) drawShotButton(cv, logSave, logSaveAt);
         long now = System.currentTimeMillis();
         boolean blink = recording && ((now - recSince) / 500) % 2 == 0;
         fill.setColor(recording ? (blink ? 0xD0E0453A : 0x70E0453A) : 0x30000000);

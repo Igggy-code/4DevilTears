@@ -47,6 +47,8 @@ public class DevilActivity extends SDLActivity {
      *  tapping the "Settings" title 8 times turns it on, 3 more taps turn it off. */
     static volatile boolean sDebugRec = false;
     static final String KEY_DEV_MODE = "developer_mode";
+    /** Renderer tests (developer mode): 3D scene pixel shaders drawn flat (measure their cost). */
+    static final String KEY_TEST_FLAT_PS = "test_flat_ps";
     private int devTaps = 0;
     private long devTapAt = 0;
     /** Skip the intro movie at launch (on by default when the edition's intro carries
@@ -70,6 +72,64 @@ public class DevilActivity extends SDLActivity {
     static final String KEY_FADE_IDLE = "pad_fade_idle";
     static final String KEY_ESSENTIAL = "pad_essential";
     static final String KEY_SKIP_INTRO = "skip_intro";
+    /** Graphics preset: 0 quality (default), 1 balanced, 2 performance. */
+    static final String KEY_GFX_PRESET = "graphics_preset";
+    /** Internal render resolution, percent of 1280x720 (100 / 80 / 75 / 70); next start. */
+    static final String KEY_RES_SCALE = "render_scale";
+    static volatile int sRenderScale = 100;
+
+    /**
+     * Renderer / engine flags of a graphics preset: texture anisotropy, drawn effect clears,
+     * shadows, bloom/glare, and the game engine's own options (lighting, motion blur - the PC
+     * version's settings, present in this build too). Quality = the console's look.
+     */
+    static String[][] graphicsFlags(int preset) {
+        switch (preset) {
+            case 1: return new String[][] { { "anisotropic_override", "0" }, { "fast_effect_clears", "true" },
+                    { "dmc4_skip_shadow_maps", "false" }, { "dmc4_lighting", "1" },
+                    { "dmc4_texture_detail", "0" }, { "dmc4_motion_blur", "2" }, { "dmc4_glare", "true" } };
+            case 2: return new String[][] { { "anisotropic_override", "0" }, { "fast_effect_clears", "true" },
+                    { "dmc4_skip_shadow_maps", "true" }, { "dmc4_lighting", "2" },
+                    { "dmc4_texture_detail", "0" }, { "dmc4_motion_blur", "3" }, { "dmc4_glare", "false" } };
+            default: return new String[][] { { "anisotropic_override", "3" }, { "fast_effect_clears", "false" },
+                    { "dmc4_skip_shadow_maps", "false" }, { "dmc4_lighting", "0" },
+                    { "dmc4_texture_detail", "0" }, { "dmc4_motion_blur", "1" }, { "dmc4_glare", "true" } };
+        }
+    }
+
+    /** Preset 3 = custom: every option from its own setting (Advanced). */
+    static final int GFX_CUSTOM = 3;
+    /** Advanced graphics options: flag, title, values, labels. */
+    static final String[][] GFX_ADVANCED = {
+        { "dmc4_lighting", "Lighting", "0,1,2", "High,Medium,Low" },
+        { "dmc4_motion_blur", "Motion blur", "0,1,2,3", "High,Medium,Low,Off" },
+        { "anisotropic_override", "Texture filtering", "0,2,3,4,5", "Simple,2x,4x,8x,16x" },
+        { "dmc4_skip_shadow_maps", "Shadows", "false,true", "On,Off" },
+        { "dmc4_glare", "Bloom & glare", "true,false", "On,Off" },
+        { "fast_effect_clears", "Effect buffer clears", "false,true", "Exact,Fast" },
+    };
+
+    static String presetValue(int preset, String flag) {
+        for (String[] f : graphicsFlags(preset)) if (f[0].equals(flag)) return f[1];
+        return null;
+    }
+
+    /** The flags in force: the preset's, or each Advanced option's own value for "custom". */
+    String[][] currentGraphicsFlags() {
+        int preset = prefs().getInt(KEY_GFX_PRESET, 0);
+        if (preset != GFX_CUSTOM) return graphicsFlags(preset);
+        String[][] base = graphicsFlags(0);
+        String[][] out = new String[base.length][];
+        for (int i = 0; i < base.length; i++) {
+            // Only the Advanced options come from their own setting; the rest (texture detail,
+            // always High - no visible difference when lowered) stay as in Quality.
+            boolean adv = false;
+            for (String[] a : GFX_ADVANCED) if (a[0].equals(base[i][0])) adv = true;
+            out[i] = new String[] { base[i][0],
+                    adv ? prefs().getString("gfx_" + base[i][0], base[i][1]) : base[i][1] };
+        }
+        return out;
+    }
 
     /** The intro movie of this edition was replaced by a re-encoded one with captions. */
     private boolean editedIntro() {
@@ -215,6 +275,289 @@ public class DevilActivity extends SDLActivity {
         } catch (Exception e) { Log.w(TAG, "setFrameRate", e); }
     }
 
+    static final int REQ_SAVE_DIAG = 4207;
+    static final int REQ_GPU_DRIVER = 4208;
+    /** Custom Vulkan driver (Snapdragon / Adreno only): folder name in files/gpu_drivers, "" = system. */
+    static final String KEY_GPU_DRIVER = "gpu_driver";
+    private android.widget.RadioGroup driverGroup;
+
+    private File gpuDriversDir() { return new File(getFilesDir(), "gpu_drivers"); }
+
+    /** Adreno GPU (the only one custom driver packages work on). */
+    static boolean isAdreno() {
+        if (new File("/dev/kgsl-3d0").exists()) return true;
+        if (android.os.Build.VERSION.SDK_INT >= 31) {
+            String m = android.os.Build.SOC_MANUFACTURER;
+            if (m != null && (m.equalsIgnoreCase("QTI") || m.toLowerCase().contains("qualcomm"))) return true;
+        }
+        return false;
+    }
+
+    /** Library file name of an installed driver package (meta.json "libraryName", else the first .so). */
+    private String gpuDriverLibrary(File dir) {
+        try {
+            File meta = new File(dir, "meta.json");
+            if (meta.isFile()) {
+                org.json.JSONObject j = new org.json.JSONObject(new String(
+                        java.nio.file.Files.readAllBytes(meta.toPath()), "UTF-8"));
+                String lib = j.optString("libraryName", "");
+                if (!lib.isEmpty() && new File(dir, lib).isFile()) return lib;
+            }
+        } catch (Exception e) { Log.w(TAG, "driver meta", e); }
+        File[] fs = dir.listFiles();
+        if (fs != null) for (File f : fs) if (f.getName().endsWith(".so")) return f.getName();
+        return null;
+    }
+
+    private String gpuDriverTitle(File dir) {
+        try {
+            File meta = new File(dir, "meta.json");
+            if (meta.isFile()) {
+                org.json.JSONObject j = new org.json.JSONObject(new String(
+                        java.nio.file.Files.readAllBytes(meta.toPath()), "UTF-8"));
+                String name = j.optString("name", dir.getName());
+                String ver = j.optString("driverVersion", "");
+                return ver.isEmpty() ? name : name + " (" + ver + ")";
+            }
+        } catch (Exception ignored) { }
+        return dir.getName();
+    }
+
+    private void refreshDriverGroup() {
+        if (driverGroup == null) return;
+        driverGroup.setOnCheckedChangeListener(null);
+        driverGroup.removeAllViews();
+        final ArrayList<String> ids = new ArrayList<>();
+        ids.add("");
+        File[] dirs = gpuDriversDir().listFiles();
+        if (dirs != null) {
+            java.util.Arrays.sort(dirs);
+            for (File d : dirs) if (d.isDirectory() && gpuDriverLibrary(d) != null) ids.add(d.getName());
+        }
+        String now = prefs().getString(KEY_GPU_DRIVER, "");
+        for (int i = 0; i < ids.size(); i++) {
+            android.widget.RadioButton rb = new android.widget.RadioButton(this);
+            rb.setText(ids.get(i).isEmpty() ? "System driver (default)"
+                    : gpuDriverTitle(new File(gpuDriversDir(), ids.get(i))));
+            rb.setTextSize(15);
+            rb.setTextColor(0xFFEDEDED);
+            rb.setPadding(dpx(4), dpx(6), 0, dpx(6));
+            rb.setId(4300 + i);
+            rb.setChecked(ids.get(i).equals(now));
+            driverGroup.addView(rb);
+        }
+        driverGroup.setOnCheckedChangeListener((g, id) -> {
+            prefs().edit().putString(KEY_GPU_DRIVER, ids.get(id - 4300)).apply();
+            askRestart("The GPU driver changes after a restart.");
+        });
+    }
+
+    /** Unpacks a driver package (.zip with meta.json and the driver .so, as made for emulators). */
+    private void importGpuDriver(final android.net.Uri uri) {
+        Toast.makeText(this, "Installing driver...", Toast.LENGTH_SHORT).show();
+        new Thread(() -> {
+            String msg;
+            boolean installed = false;
+            File tmp = new File(gpuDriversDir(), ".incoming");
+            try {
+                deleteTree(tmp);
+                tmp.mkdirs();
+                try (java.io.InputStream is = getContentResolver().openInputStream(uri);
+                     java.util.zip.ZipInputStream zip = new java.util.zip.ZipInputStream(is)) {
+                    java.util.zip.ZipEntry e;
+                    while ((e = zip.getNextEntry()) != null) {
+                        if (e.isDirectory()) continue;
+                        String name = new File(e.getName()).getName();  // flat: no folders, no ../
+                        if (name.isEmpty() || name.startsWith(".")) continue;
+                        java.nio.file.Files.copy(zip, new File(tmp, name).toPath(),
+                                java.nio.file.StandardCopyOption.REPLACE_EXISTING);
+                    }
+                }
+                String lib = gpuDriverLibrary(tmp);
+                if (lib == null) throw new java.io.IOException("no driver library (.so) in the package");
+                String id = gpuDriverTitle(tmp).replaceAll("[^A-Za-z0-9._-]+", "_");
+                if (id.isEmpty() || id.startsWith(".")) id = "driver";
+                File dst = new File(gpuDriversDir(), id);
+                deleteTree(dst);
+                if (!tmp.renameTo(dst)) throw new java.io.IOException("could not store the driver");
+                prefs().edit().putString(KEY_GPU_DRIVER, id).apply();
+                msg = "Driver installed: " + gpuDriverTitle(dst);
+                installed = true;
+            } catch (Exception ex) {
+                Log.w(TAG, "importGpuDriver", ex);
+                deleteTree(tmp);
+                msg = "Driver not installed: " + ex.getMessage();
+            }
+            final String m = msg;
+            final boolean ok = installed;
+            runOnUiThread(() -> {
+                refreshDriverGroup();
+                if (ok) askRestart(m + ". It is used after a restart.");
+                else Toast.makeText(this, m, Toast.LENGTH_LONG).show();
+            });
+        }, "gpu-driver-import").start();
+    }
+
+    /**
+     * A message box of the game (XamShowMessageBoxUI, e.g. "overwrite this save?"), called from
+     * a native worker thread: shown as a dialog, blocks until a button is chosen.
+     */
+    public int showGameMessage(final String title, final String text, final String[] buttons, final int active) {
+        if (android.os.Looper.myLooper() == android.os.Looper.getMainLooper()) return active;
+        final int[] chosen = { active };
+        final java.util.concurrent.CountDownLatch done = new java.util.concurrent.CountDownLatch(1);
+        runOnUiThread(() -> {
+            try {
+                android.app.AlertDialog.Builder b = new android.app.AlertDialog.Builder(this);
+                if (title != null && !title.isEmpty()) b.setTitle(title);
+                b.setMessage(text != null ? text : "");
+                b.setCancelable(false);
+                int n = buttons != null ? buttons.length : 0;
+                if (n == 0) {
+                    b.setPositiveButton("OK", (d, w) -> { chosen[0] = active; done.countDown(); });
+                } else {
+                    // Button 0 (usually "Yes" / "OK") on the right, as Android dialogs do.
+                    b.setPositiveButton(buttons[0], (d, w) -> { chosen[0] = 0; done.countDown(); });
+                    if (n > 1) b.setNegativeButton(buttons[1], (d, w) -> { chosen[0] = 1; done.countDown(); });
+                    if (n > 2) b.setNeutralButton(buttons[2], (d, w) -> { chosen[0] = 2; done.countDown(); });
+                }
+                b.show();
+            } catch (Exception e) {
+                Log.w(TAG, "showGameMessage", e);
+                done.countDown();
+            }
+        });
+        try { done.await(); } catch (InterruptedException ignored) { }
+        return chosen[0];
+    }
+
+    /** "Restart now?" - the game is closed (unsaved progress is lost) and opened again. */
+    private void askRestart(String why) {
+        new android.app.AlertDialog.Builder(this)
+                .setMessage(why + "\nRestart the game now? Unsaved progress will be lost.")
+                .setPositiveButton("Restart", (d, w) -> restartApp())
+                .setNegativeButton("Later", null)
+                .show();
+    }
+
+    private void restartApp() {
+        android.content.Intent launch = getPackageManager().getLaunchIntentForPackage(getPackageName());
+        if (launch == null) return;
+        // The task restarts with the launcher activity; the system brings up a fresh process for it.
+        startActivity(android.content.Intent.makeRestartActivityTask(launch.getComponent()));
+        Runtime.getRuntime().exit(0);
+    }
+
+    /** Removes the "driver pending" marker after a few seconds of real frames. */
+    private void watchFirstFrames(final File marker) {
+        final android.os.Handler h = new android.os.Handler(android.os.Looper.getMainLooper());
+        final int[] good = { 0 }, tries = { 0 };
+        h.postDelayed(new Runnable() {
+            @Override public void run() {
+                float f = 0f;
+                try { f = TouchGamepadView.nativeFps(); } catch (Throwable ignored) { }
+                good[0] = f > 0.5f ? good[0] + 1 : 0;
+                if (good[0] >= 3) { marker.delete(); return; }
+                if (++tries[0] < 300) h.postDelayed(this, 2000);  // up to 10 minutes (first shader build)
+            }
+        }, 2000);
+    }
+
+    private static void deleteTree(File f) {
+        File[] kids = f.listFiles();
+        if (kids != null) for (File k : kids) deleteTree(k);
+        f.delete();
+    }
+
+    /** "Save diagnostics": the player picks where (e.g. Downloads) - one zip for a forum post. */
+    void saveDiagnostics() {
+        String model = (android.os.Build.MANUFACTURER + "_" + android.os.Build.MODEL).replaceAll("[^A-Za-z0-9_-]", "");
+        String stamp = new java.text.SimpleDateFormat("yyyyMMdd_HHmm", java.util.Locale.US).format(new java.util.Date());
+        android.content.Intent pick = new android.content.Intent(android.content.Intent.ACTION_CREATE_DOCUMENT);
+        pick.addCategory(android.content.Intent.CATEGORY_OPENABLE);
+        pick.setType("application/zip");
+        pick.putExtra(android.content.Intent.EXTRA_TITLE, "4DevilTears_" + model + "_" + stamp + ".zip");
+        try { startActivityForResult(pick, REQ_SAVE_DIAG); }
+        catch (Exception e) { Toast.makeText(this, "No file picker on this device", Toast.LENGTH_LONG).show(); }
+    }
+
+    @Override
+    protected void onActivityResult(int requestCode, int resultCode, android.content.Intent data) {
+        super.onActivityResult(requestCode, resultCode, data);
+        if (requestCode == REQ_GPU_DRIVER && resultCode == RESULT_OK && data != null && data.getData() != null) {
+            importGpuDriver(data.getData());
+            return;
+        }
+        if (requestCode != REQ_SAVE_DIAG || resultCode != RESULT_OK || data == null || data.getData() == null) return;
+        final android.net.Uri dest = data.getData();
+        final String info = deviceSummary();
+        Toast.makeText(this, "Saving diagnostics...", Toast.LENGTH_SHORT).show();
+        new Thread(() -> {
+            String result;
+            try (java.io.OutputStream os = getContentResolver().openOutputStream(dest);
+                 java.util.zip.ZipOutputStream zip = new java.util.zip.ZipOutputStream(os)) {
+                zip.putNextEntry(new java.util.zip.ZipEntry("device.txt"));
+                zip.write(info.getBytes("UTF-8"));
+                zip.closeEntry();
+                int n = 1;
+                File[] files = getFilesDir().listFiles();
+                if (files != null) {
+                    for (File f : files) {
+                        String name = f.getName();
+                        boolean wanted = name.equals("dmc4.log") || name.equals("dmc4.1.log")
+                                || name.startsWith("gfx_") || name.startsWith("ui_")
+                                || name.equals("perf.csv") || name.equals("state.txt") || name.equals("args.txt")
+                                || name.equals("frame_trace.txt") || name.startsWith("rec_")
+                                || name.equals("crash.txt") || name.startsWith("gpu_driver_");
+                        if (!wanted || !f.isFile() || f.length() == 0) continue;
+                        zip.putNextEntry(new java.util.zip.ZipEntry(name));
+                        java.nio.file.Files.copy(f.toPath(), zip);
+                        zip.closeEntry();
+                        n++;
+                    }
+                }
+                // The captures are in the zip now: free their space (GFX ~14 MB, REC ~1.2 MB a minute).
+                if (files != null) {
+                    for (File f : files) {
+                        String name = f.getName();
+                        if (name.startsWith("gfx_") || name.startsWith("rec_") || name.equals("crash.txt")
+                                || (name.startsWith("ui_") && name.endsWith(".png"))) f.delete();
+                    }
+                }
+                result = "Diagnostics saved (" + n + " files)";
+            } catch (Exception e) {
+                Log.w(TAG, "saveDiagnostics", e);
+                result = "Could not save: " + e.getMessage();
+            }
+            final String msg = result;
+            runOnUiThread(() -> Toast.makeText(this, msg, Toast.LENGTH_LONG).show());
+        }, "save-diagnostics").start();
+    }
+
+    private String deviceSummary() {
+        StringBuilder info = new StringBuilder("4DevilTears ");
+        try { info.append(getPackageManager().getPackageInfo(getPackageName(), 0).versionName); }
+        catch (Exception e) { info.append('?'); }
+        info.append("\nDevice: ").append(android.os.Build.MANUFACTURER).append(' ')
+            .append(android.os.Build.MODEL).append(" (").append(android.os.Build.DEVICE).append(")");
+        if (android.os.Build.VERSION.SDK_INT >= 31) {
+            info.append("\nSoC: ").append(android.os.Build.SOC_MANUFACTURER).append(' ')
+                .append(android.os.Build.SOC_MODEL);
+        }
+        info.append("\nAndroid: ").append(android.os.Build.VERSION.RELEASE)
+            .append(" (API ").append(android.os.Build.VERSION.SDK_INT).append(")")
+            .append("\nBuild: ").append(android.os.Build.FINGERPRINT);
+        try {
+            android.app.ActivityManager.MemoryInfo mi = new android.app.ActivityManager.MemoryInfo();
+            ((android.app.ActivityManager) getSystemService(ACTIVITY_SERVICE)).getMemoryInfo(mi);
+            info.append("\nRAM: ").append(mi.totalMem / (1024 * 1024)).append(" MB");
+        } catch (Exception ignored) { }
+        info.append("\nAdreno: ").append(isAdreno()).append(", GPU driver: ")
+            .append(prefs().getString(KEY_GPU_DRIVER, "").isEmpty() ? "system" : prefs().getString(KEY_GPU_DRIVER, ""));
+        info.append("\nSettings: ").append(prefs().getAll().toString()).append('\n');
+        return info.toString();
+    }
+
     private android.widget.Switch switchRow(String text, boolean checked,
             android.widget.CompoundButton.OnCheckedChangeListener listener) {
         android.widget.Switch sw = new android.widget.Switch(this);
@@ -262,7 +605,10 @@ public class DevilActivity extends SDLActivity {
             devTaps = 0;
             sDebugRec = !sDebugRec;
             p.edit().putBoolean(KEY_DEV_MODE, sDebugRec).apply();
-            Toast.makeText(this, sDebugRec ? "Developer mode on: REC / UI / GFX buttons"
+            // Developer mode also logs GPU time per render pass (PROF lines every 120 frames).
+            try { nativeSetFlag("gpu_profile", sDebugRec ? "true" : "false"); }
+            catch (UnsatisfiedLinkError e) { Log.w(TAG, "nativeSetFlag", e); }
+            Toast.makeText(this, sDebugRec ? "Developer mode on: REC / UI / GFX / LOG buttons"
                     : "Developer mode off", Toast.LENGTH_SHORT).show();
             if (gamepadView != null) gamepadView.invalidate();
         });
@@ -323,6 +669,180 @@ public class DevilActivity extends SDLActivity {
                 applyFrameRateHint(cap);
             });
             settingsPanel.addView(caps[i]);
+        }
+
+        // Graphics presets: less texture filtering and cheaper effect clears on weaker phones.
+        android.widget.TextView gfxTitle = label("Graphics", 13, 0xFFE0453A, true);
+        gfxTitle.setPadding(0, dpx(14), 0, dpx(4));
+        settingsPanel.addView(gfxTitle);
+        android.widget.RadioGroup gfxGroup = new android.widget.RadioGroup(this);
+        String[] gfxTexts = { "Quality (best picture)",
+                "Balanced (lighter lighting and filtering, fast glow)",
+                "Performance (low lighting and textures, no shadows or motion blur)" };
+        int gfxNow = p.getInt(KEY_GFX_PRESET, 0);
+        for (int i = 0; i < gfxTexts.length; i++) {
+            android.widget.RadioButton rb = new android.widget.RadioButton(this);
+            rb.setText(gfxTexts[i]);
+            rb.setTextSize(15);
+            rb.setTextColor(0xFFEDEDED);
+            rb.setPadding(dpx(4), dpx(6), 0, dpx(6));
+            rb.setId(4100 + i);
+            rb.setChecked(i == gfxNow);
+            gfxGroup.addView(rb);
+        }
+        final java.util.List<android.widget.TextView> advRows = new java.util.ArrayList<>();
+        final Runnable refreshAdv = () -> {
+            String[][] now = currentGraphicsFlags();
+            for (int i = 0; i < GFX_ADVANCED.length && i < advRows.size(); i++) {
+                String[] a = GFX_ADVANCED[i];
+                String v = presetValue(0, a[0]);
+                for (String[] f : now) if (f[0].equals(a[0])) v = f[1];
+                String[] vals = a[2].split(","), labels = a[3].split(",");
+                String shown = v;
+                for (int k = 0; k < vals.length; k++) if (vals[k].equals(v)) shown = labels[k];
+                advRows.get(i).setText(shown);
+            }
+        };
+        gfxGroup.setOnCheckedChangeListener((g, id) -> {
+            if (id < 4100 || id > 4102) return;
+            int preset = id - 4100;
+            p.edit().putInt(KEY_GFX_PRESET, preset).apply();
+            try {
+                for (String[] f : graphicsFlags(preset)) nativeSetFlag(f[0], f[1]);
+            } catch (UnsatisfiedLinkError e) { Log.w(TAG, "nativeSetFlag", e); }
+            refreshAdv.run();
+        });
+        settingsPanel.addView(gfxGroup);
+
+        // Advanced: each option on its own (tap a row to change it); a change makes the preset "custom".
+        final android.widget.LinearLayout advBox = new android.widget.LinearLayout(this);
+        advBox.setOrientation(android.widget.LinearLayout.VERTICAL);
+        advBox.setPadding(dpx(12), 0, 0, 0);
+        advBox.setVisibility(android.view.View.GONE);
+        final android.widget.TextView advToggle = label("Advanced settings  \u25B8", 15, 0xFFEDEDED, false);
+        advToggle.setPadding(0, dpx(8), 0, dpx(6));
+        advToggle.setOnClickListener(v -> {
+            boolean open = advBox.getVisibility() != android.view.View.VISIBLE;
+            advBox.setVisibility(open ? android.view.View.VISIBLE : android.view.View.GONE);
+            advToggle.setText(open ? "Advanced settings  \u25BE" : "Advanced settings  \u25B8");
+        });
+        settingsPanel.addView(advToggle);
+        advBox.addView(label("Applied at once.",
+                12, 0xFF9AA0AA, false));
+        for (final String[] a : GFX_ADVANCED) {
+            // One row: name on the left, then  <  value  >  - each arrow steps the value.
+            android.widget.LinearLayout row = new android.widget.LinearLayout(this);
+            row.setOrientation(android.widget.LinearLayout.HORIZONTAL);
+            row.setGravity(android.view.Gravity.CENTER_VERTICAL);
+            row.setPadding(0, dpx(2), 0, dpx(2));
+            android.widget.TextView name = label(a[1], 15, 0xFFB8BEC8, false);
+            row.addView(name, new android.widget.LinearLayout.LayoutParams(0,
+                    android.view.ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+            android.widget.TextView left = label("\u25C0", 16, 0xFFE0453A, true);
+            android.widget.TextView value = label("", 15, 0xFFEDEDED, true);
+            android.widget.TextView right = label("\u25B6", 16, 0xFFE0453A, true);
+            value.setGravity(android.view.Gravity.CENTER);
+            value.setMinWidth(dpx(84));
+            left.setPadding(dpx(14), dpx(8), dpx(10), dpx(8));
+            right.setPadding(dpx(10), dpx(8), dpx(14), dpx(8));
+            row.addView(left);
+            row.addView(value);
+            row.addView(right);
+            final java.util.function.IntConsumer step = dir -> {
+                String[][] now = currentGraphicsFlags();
+                // Going custom: keep every option where it is now.
+                android.content.SharedPreferences.Editor ed = p.edit();
+                for (String[] f : now) ed.putString("gfx_" + f[0], f[1]);
+                String cur = presetValue(0, a[0]);
+                for (String[] f : now) if (f[0].equals(a[0])) cur = f[1];
+                String[] vals = a[2].split(",");
+                int k = 0;
+                for (int j = 0; j < vals.length; j++) if (vals[j].equals(cur)) k = j;
+                String next = vals[(k + dir + vals.length) % vals.length];
+                ed.putString("gfx_" + a[0], next).putInt(KEY_GFX_PRESET, GFX_CUSTOM).apply();
+                try { nativeSetFlag(a[0], next); } catch (UnsatisfiedLinkError e) { Log.w(TAG, "nativeSetFlag", e); }
+                gfxGroup.clearCheck();
+                refreshAdv.run();
+            };
+            left.setOnClickListener(v -> step.accept(-1));
+            right.setOnClickListener(v -> step.accept(1));
+            value.setOnClickListener(v -> step.accept(1));
+            advRows.add(value);
+            advBox.addView(row);
+        }
+        settingsPanel.addView(advBox);
+        refreshAdv.run();
+
+        android.widget.TextView resTitle = label("Gameplay resolution (after restarting the game)", 13, 0xFFE0453A, true);
+        resTitle.setPadding(0, dpx(14), 0, dpx(4));
+        settingsPanel.addView(resTitle);
+        android.widget.RadioGroup resGroup = new android.widget.RadioGroup(this);
+        final int[] resValues = { 100, 80, 75, 70 };
+        String[] resTexts = { "100% - 1280x720 (native)", "80% - 1024x576", "75% - 960x544",
+                "70% - 896x512" };
+        int resNow = p.getInt(KEY_RES_SCALE, 100);
+        for (int i = 0; i < resValues.length; i++) {
+            android.widget.RadioButton rb = new android.widget.RadioButton(this);
+            rb.setText(resTexts[i]);
+            rb.setTextSize(15);
+            rb.setTextColor(0xFFEDEDED);
+            rb.setPadding(dpx(4), dpx(6), 0, dpx(6));
+            rb.setId(4200 + i);
+            rb.setChecked(resValues[i] == resNow);
+            resGroup.addView(rb);
+        }
+        resGroup.setOnCheckedChangeListener((g, id) -> {
+            p.edit().putInt(KEY_RES_SCALE, resValues[id - 4200]).apply();
+            Toast.makeText(this, "Takes effect after restarting the game", Toast.LENGTH_SHORT).show();
+        });
+        settingsPanel.addView(resGroup);
+
+        // GPU driver: Snapdragon only (shown on other phones in developer mode, for testing).
+        if (isAdreno() || sDebugRec) {
+            android.widget.TextView drvTitle = label("GPU driver", 13, 0xFFE0453A, true);
+            drvTitle.setPadding(0, dpx(14), 0, dpx(4));
+            settingsPanel.addView(drvTitle);
+            settingsPanel.addView(label("Custom Vulkan drivers", 13, 0xFFB8BEC8, false));
+            driverGroup = new android.widget.RadioGroup(this);
+            settingsPanel.addView(driverGroup);
+            refreshDriverGroup();
+            android.widget.TextView addDrv = label("Install driver (.zip)...", 15, 0xFFEDEDED, false);
+            addDrv.setPadding(0, dpx(8), 0, dpx(4));
+            addDrv.setOnClickListener(v -> {
+                android.content.Intent pick = new android.content.Intent(android.content.Intent.ACTION_OPEN_DOCUMENT);
+                pick.addCategory(android.content.Intent.CATEGORY_OPENABLE);
+                pick.setType("*/*");
+                pick.putExtra(android.content.Intent.EXTRA_MIME_TYPES,
+                        new String[] { "application/zip", "application/x-zip-compressed", "application/octet-stream" });
+                try { startActivityForResult(pick, REQ_GPU_DRIVER); }
+                catch (Exception e) { Toast.makeText(this, "No file picker on this device", Toast.LENGTH_LONG).show(); }
+            });
+            settingsPanel.addView(addDrv);
+            android.widget.TextView delDrv = label("Remove selected driver", 15, 0xFFEDEDED, false);
+            delDrv.setPadding(0, dpx(4), 0, dpx(8));
+            delDrv.setOnClickListener(v -> {
+                String cur = prefs().getString(KEY_GPU_DRIVER, "");
+                if (cur.isEmpty()) return;
+                deleteTree(new File(gpuDriversDir(), cur));
+                prefs().edit().putString(KEY_GPU_DRIVER, "").apply();
+                refreshDriverGroup();
+                Toast.makeText(this, "Driver removed - the system driver is used after restart",
+                        Toast.LENGTH_SHORT).show();
+            });
+            settingsPanel.addView(delDrv);
+        }
+
+        // Renderer tests: developer mode only, applied at the next start.
+        if (sDebugRec) {
+            android.widget.TextView testTitle = label("Renderer tests", 13, 0xFFE0453A, true);
+            testTitle.setPadding(0, dpx(14), 0, dpx(0));
+            settingsPanel.addView(testTitle);
+            settingsPanel.addView(label("Applied after restart.", 12, 0xFF9AA0AA, false));
+            settingsPanel.addView(switchRow("Flat 3D scene shaders (measure)",
+                    p.getBoolean(KEY_TEST_FLAT_PS, false), (b, on) -> {
+                        p.edit().putBoolean(KEY_TEST_FLAT_PS, on).apply();
+                        askRestart("Renderer test changed.");
+                    }));
         }
 
         android.widget.TextView overlayTitle = label("Overlay", 13, 0xFFE0453A, true);
@@ -396,6 +916,7 @@ public class DevilActivity extends SDLActivity {
             startActivity(new android.content.Intent(this, ImportActivity.class).putExtra("reimport", true));
         });
         settingsPanel.addView(reimport);
+
 
         android.widget.TextView padTitle = label("Controllers", 13, 0xFFE0453A, true);
         padTitle.setPadding(0, dpx(14), 0, dpx(4));
@@ -605,6 +1126,10 @@ public class DevilActivity extends SDLActivity {
         // default locations are next to the .so files (/data/app/..., read-only).
         args.add("--log_file");
         args.add(files + "/dmc4.log");
+        // Log size: 5 MB pieces, the current one + 2 older (15 MB at most). Pieces left over
+        // from the old limit of 20 are removed.
+        args.add("--log_max_files=2");
+        for (int i = 3; i <= 20; i++) new File(files, "dmc4." + i + ".log").delete();
         args.add("--user_data_root");
         args.add(files + "/user");
         args.add("--cache_root");
@@ -646,6 +1171,50 @@ public class DevilActivity extends SDLActivity {
         // The intro movie is skipped by the app: draw nothing of it meanwhile.
         if (prefs().getBoolean(KEY_SKIP_INTRO, false)) args.add("--dmc4_hide_first_movie=true");
         if (prefs().getInt(KEY_FPS_CAP, 0) > 0) args.add("--frame_rate_limit=" + prefs().getInt(KEY_FPS_CAP, 0));
+        for (String[] f : currentGraphicsFlags()) args.add("--" + f[0] + "=" + f[1]);
+        sRenderScale = prefs().getInt(KEY_RES_SCALE, 100);
+        if (sRenderScale < 100) args.add("--dmc4_render_scale=" + sRenderScale);
+        if (prefs().getBoolean(KEY_DEV_MODE, false)) {
+            args.add("--gpu_profile=true");
+            if (prefs().getBoolean(KEY_TEST_FLAT_PS, false)) args.add("--vulkan_flat_ps=SCENE");
+        }
+        // A custom driver that took the previous start down before the first frame (crash or
+        // hang): back to the system driver, with a note for the diagnostics zip.
+        File pending = new File(getFilesDir(), "gpu_driver_pending.txt");
+        if (pending.isFile()) {
+            String bad = "";
+            try { bad = new String(java.nio.file.Files.readAllBytes(pending.toPath()), "UTF-8").trim(); }
+            catch (Exception ignored) { }
+            pending.delete();
+            if (!bad.isEmpty() && bad.equals(prefs().getString(KEY_GPU_DRIVER, ""))) {
+                prefs().edit().putString(KEY_GPU_DRIVER, "").apply();
+                try {
+                    String note = new java.text.SimpleDateFormat("yyyy-MM-dd HH:mm:ss", java.util.Locale.US)
+                            .format(new java.util.Date()) + " driver '" + bad
+                            + "' did not reach the first frame last time - switched back to the system driver\n";
+                    java.nio.file.Files.write(new File(getFilesDir(), "gpu_driver_log.txt").toPath(),
+                            note.getBytes("UTF-8"), java.nio.file.StandardOpenOption.CREATE,
+                            java.nio.file.StandardOpenOption.APPEND);
+                } catch (Exception ignored) { }
+                runOnUiThread(() -> Toast.makeText(this, "The custom GPU driver did not start last time. "
+                        + "Switched back to the system driver.", Toast.LENGTH_LONG).show());
+            }
+        }
+        String drv = prefs().getString(KEY_GPU_DRIVER, "");
+        if (!drv.isEmpty()) {
+            File dir = new File(gpuDriversDir(), drv);
+            String lib = dir.isDirectory() ? gpuDriverLibrary(dir) : null;
+            if (lib != null) {
+                args.add("--vulkan_custom_driver_dir=" + dir.getAbsolutePath() + "/");
+                args.add("--vulkan_custom_driver_name=" + lib);
+                args.add("--vulkan_custom_driver_hooks=" + getApplicationInfo().nativeLibraryDir + "/");
+                // Cleared once the game shows frames (watchFirstFrames); still there next start =
+                // this driver crashed or hung.
+                try { java.nio.file.Files.write(pending.toPath(), drv.getBytes("UTF-8")); }
+                catch (Exception e) { Log.w(TAG, "driver marker", e); }
+                watchFirstFrames(pending);
+            }
+        }
         // Extra flags for experiments without rebuilding: files/args.txt
         File extra = new File(getFilesDir(), "args.txt");
         if (extra.canRead()) {
